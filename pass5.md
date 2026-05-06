@@ -2267,4 +2267,2695 @@ Wikilink regex handles all three syntaxes ([[Page]], [[Page|Display]], [[Page|Di
 
 
 
+Pass 5 — packages/wiki (Part 2 of 2)
+Continuing from Part 1. This pass completes the @locoworker/wiki package with the export pipeline, agent sync integration, filesystem watcher, the barrel export, and all four fully runnable bun test test suites.
 
+What this pass generates
+File	Purpose
+src/WikiExporter.ts	HTML bundle / single-file Markdown / JSON dump exports
+src/WikiSyncAgent.ts	Agent-triggered page write pipeline — integrates with packages/core EventBus + HooksRegistry
+src/WikiWatcher.ts	fs.watch-based auto-sync: file save → WikiStore.upsertPage
+src/index.ts	Clean barrel export
+src/tests/WikiStore.test.ts	Full bun test suite for WikiStore
+src/tests/WikiParser.test.ts	Full bun test suite for WikiParser
+src/tests/WikiSearch.test.ts	Full bun test suite for WikiSearch
+src/tests/WikiLinker.test.ts	Full bun test suite for WikiLinker
+src/WikiExporter.ts
+TypeScript
+
+/**
+ * WikiExporter — multi-format export pipeline for @locoworker/wiki
+ *
+ * Supported output formats:
+ *   html            → a self-contained HTML file per page + an index.html
+ *   markdown_bundle → all pages concatenated into a single WIKI.md file
+ *   json            → structured JSON dump (array of WikiPage objects)
+ *
+ * Design:
+ *  - WikiExporter is read-only (never modifies DB or source files).
+ *  - All output is written to a configurable output directory.
+ *  - HTML output is vanilla, dependency-free (inline CSS, no external JS).
+ *    This keeps it safe to commit, diff, and view offline.
+ *  - The Markdown bundle respects page `order` frontmatter and falls back
+ *    to alphabetical slug order.
+ *  - JSON dump includes resolved backlink counts per page for downstream use.
+ *  - WikiExporter can optionally generate a Mermaid link-graph diagram
+ *    (rendered as a fenced code block inside the Markdown bundle).
+ *
+ * Dependencies: WikiStore (read), WikiLinker (graph), WikiParser (render)
+ */
+
+import { mkdir, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import type { WikiStore } from './WikiStore.js';
+import type { WikiLinker } from './WikiLinker.js';
+import { WikiParser } from './WikiParser.js';
+import type {
+  WikiExportFormat,
+  WikiPageRow,
+  WikiFrontmatter,
+} from './types/wiki.types.js';
+
+// ─── Option types ─────────────────────────────────────────────────────────────
+
+export interface WikiExportOptions {
+  /** Output format. Default: 'markdown_bundle'. */
+  format?: WikiExportFormat;
+
+  /** Directory to write output files into. Default: '.locoworker/wiki/export'. */
+  outputDir?: string;
+
+  /** Include hidden pages. Default: false. */
+  includeHidden?: boolean;
+
+  /** Include archived pages. Default: false. */
+  includeArchived?: boolean;
+
+  /** Include a Mermaid link-graph diagram in Markdown bundle. Default: true. */
+  includeMermaidGraph?: boolean;
+
+  /** Max nodes in Mermaid graph (large wikis become unreadable). Default: 60. */
+  mermaidGraphMaxNodes?: number;
+
+  /** Pretty-print JSON output. Default: true. */
+  prettyJson?: boolean;
+}
+
+export interface WikiExportResult {
+  format: WikiExportFormat;
+  outputDir: string;
+  filesWritten: string[];
+  pageCount: number;
+  duration: number;
+}
+
+// ─── Internal page ordering ───────────────────────────────────────────────────
+
+function sortPages(pages: WikiPageRow[]): WikiPageRow[] {
+  return [...pages].sort((a, b) => {
+    const fa = JSON.parse(a.frontmatter_json) as Partial<WikiFrontmatter>;
+    const fb = JSON.parse(b.frontmatter_json) as Partial<WikiFrontmatter>;
+    const orderA = fa.order ?? Number.MAX_SAFE_INTEGER;
+    const orderB = fb.order ?? Number.MAX_SAFE_INTEGER;
+    if (orderA !== orderB) return orderA - orderB;
+    return a.slug.localeCompare(b.slug);
+  });
+}
+
+// ─── WikiExporter ─────────────────────────────────────────────────────────────
+
+export class WikiExporter {
+  private readonly parser: WikiParser;
+
+  constructor(
+    private readonly store: WikiStore,
+    private readonly linker: WikiLinker,
+  ) {
+    this.parser = new WikiParser();
+  }
+
+  /**
+   * Run the export pipeline.
+   */
+  async export(options: WikiExportOptions = {}): Promise<WikiExportResult> {
+    const format: WikiExportFormat = options.format ?? 'markdown_bundle';
+    const outputDir = options.outputDir ?? '.locoworker/wiki/export';
+    const start = Date.now();
+
+    await mkdir(outputDir, { recursive: true });
+
+    const allPages = this.store.getAllPages();
+    const filtered = allPages.filter((p) => {
+      if (!options.includeHidden) {
+        const fm = JSON.parse(p.frontmatter_json) as Partial<WikiFrontmatter>;
+        if (fm.hidden) return false;
+      }
+      if (!options.includeArchived && p.status === 'archived') return false;
+      return true;
+    });
+
+    const sorted = sortPages(filtered);
+    const filesWritten: string[] = [];
+
+    switch (format) {
+      case 'html':
+        filesWritten.push(...await this._exportHtml(sorted, outputDir));
+        break;
+      case 'markdown_bundle':
+        filesWritten.push(
+          ...(await this._exportMarkdownBundle(sorted, outputDir, options)),
+        );
+        break;
+      case 'json':
+        filesWritten.push(
+          ...(await this._exportJson(sorted, outputDir, options)),
+        );
+        break;
+    }
+
+    return {
+      format,
+      outputDir,
+      filesWritten,
+      pageCount: sorted.length,
+      duration: Date.now() - start,
+    };
+  }
+
+  // ─── HTML export ────────────────────────────────────────────────────────────
+
+  private async _exportHtml(
+    pages: WikiPageRow[],
+    outputDir: string,
+  ): Promise<string[]> {
+    const files: string[] = [];
+
+    // Write one HTML file per page
+    for (const pageRow of pages) {
+      const page = this.parser.parseContent(
+        pageRow.content,
+        pageRow.file_path,
+      );
+      // Merge back stored metadata (slug, timestamps from DB are canonical)
+      page.slug = pageRow.slug;
+      page.title = pageRow.title;
+      page.createdAt = pageRow.created_at;
+      page.updatedAt = pageRow.updated_at;
+
+      const html = this.parser.render(page);
+      const backlinks = this.store.getBacklinks(pageRow.slug);
+      const fullHtml = this._wrapHtmlPage(
+        pageRow.title,
+        html,
+        pageRow.slug,
+        backlinks.map((b) => ({ slug: b.from_slug, title: b.display_text || b.from_slug })),
+      );
+
+      const outPath = join(outputDir, `${pageRow.slug}.html`);
+      await writeFile(outPath, fullHtml, 'utf8');
+      files.push(outPath);
+    }
+
+    // Write index.html
+    const indexHtml = this._buildHtmlIndex(pages);
+    const indexPath = join(outputDir, 'index.html');
+    await writeFile(indexPath, indexHtml, 'utf8');
+    files.push(indexPath);
+
+    return files;
+  }
+
+  private _wrapHtmlPage(
+    title: string,
+    body: string,
+    slug: string,
+    backlinks: Array<{ slug: string; title: string }>,
+  ): string {
+    const backlinksHtml =
+      backlinks.length > 0
+        ? `<section class="backlinks">
+  <h2>Backlinks</h2>
+  <ul>
+    ${backlinks
+      .map((b) => `<li><a href="${b.slug}.html">${this._escHtml(b.title)}</a></li>`)
+      .join('\n    ')}
+  </ul>
+</section>`
+        : '';
+
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>${this._escHtml(title)}</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; line-height: 1.7; max-width: 860px;
+           margin: 0 auto; padding: 2rem 1.5rem; color: #1a1a2e; background: #fafaf9; }
+    h1, h2, h3, h4 { margin: 1.5rem 0 0.5rem; line-height: 1.25; }
+    h1 { font-size: 2rem; border-bottom: 2px solid #e2e8f0; padding-bottom: 0.5rem; }
+    p { margin: 0.75rem 0; }
+    a { color: #2563eb; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    a[data-wiki-slug] { color: #7c3aed; }
+    code { background: #f1f5f9; border-radius: 3px; padding: 0.1em 0.35em;
+           font-size: 0.9em; font-family: 'Fira Code', monospace; }
+    pre { background: #1e293b; color: #e2e8f0; border-radius: 6px; padding: 1rem;
+          overflow-x: auto; margin: 1rem 0; }
+    pre code { background: none; padding: 0; color: inherit; }
+    blockquote { border-left: 4px solid #6366f1; margin: 1rem 0;
+                 padding: 0.5rem 1rem; color: #475569; background: #f8f7ff; }
+    table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+    th, td { border: 1px solid #e2e8f0; padding: 0.5rem 0.75rem; text-align: left; }
+    th { background: #f1f5f9; font-weight: 600; }
+    nav.breadcrumb { font-size: 0.85rem; color: #64748b; margin-bottom: 1.5rem; }
+    nav.breadcrumb a { color: #64748b; }
+    .backlinks { margin-top: 3rem; padding-top: 1.5rem;
+                 border-top: 1px solid #e2e8f0; font-size: 0.9rem; }
+    .backlinks h2 { font-size: 1rem; color: #64748b; margin-bottom: 0.5rem; }
+    .backlinks ul { list-style: none; }
+    .backlinks li { margin: 0.25rem 0; }
+    mark { background: #fef08a; border-radius: 2px; padding: 0 2px; }
+    @media (prefers-color-scheme: dark) {
+      body { background: #0f172a; color: #e2e8f0; }
+      h1 { border-color: #334155; }
+      code { background: #1e293b; }
+      blockquote { background: #1e293b; border-color: #818cf8; color: #94a3b8; }
+      th { background: #1e293b; }
+      th, td { border-color: #334155; }
+      nav.breadcrumb { color: #94a3b8; }
+    }
+  </style>
+</head>
+<body>
+  <nav class="breadcrumb">
+    <a href="index.html">Wiki</a> › ${this._escHtml(title)}
+  </nav>
+  <article>
+    ${body}
+  </article>
+  ${backlinksHtml}
+</body>
+</html>`;
+  }
+
+  private _buildHtmlIndex(pages: WikiPageRow[]): string {
+    const stats = this.store.getStats();
+    const rows = pages
+      .map((p) => {
+        const tags = p.tags_csv
+          ? p.tags_csv
+              .split(',')
+              .map((t) => `<span class="tag">${this._escHtml(t.trim())}</span>`)
+              .join(' ')
+          : '';
+        return `<tr>
+  <td><a href="${p.slug}.html">${this._escHtml(p.title)}</a></td>
+  <td><span class="status status-${p.status}">${p.status}</span></td>
+  <td>${tags}</td>
+  <td>${p.word_count.toLocaleString()}</td>
+  <td>${p.updated_at.slice(0, 10)}</td>
+</tr>`;
+      })
+      .join('\n');
+
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Wiki Index</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 1000px;
+           margin: 0 auto; padding: 2rem 1.5rem; background: #fafaf9; color: #1a1a2e; }
+    h1 { font-size: 2rem; margin-bottom: 0.25rem; }
+    .stats { color: #64748b; font-size: 0.9rem; margin-bottom: 1.5rem; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { border: 1px solid #e2e8f0; padding: 0.5rem 0.75rem; text-align: left; }
+    th { background: #f1f5f9; font-weight: 600; cursor: pointer; }
+    a { color: #2563eb; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .tag { background: #e0e7ff; color: #3730a3; border-radius: 9999px;
+           padding: 0.1em 0.55em; font-size: 0.78rem; }
+    .status { border-radius: 9999px; padding: 0.1em 0.55em; font-size: 0.78rem; font-weight: 600; }
+    .status-active  { background: #dcfce7; color: #166534; }
+    .status-draft   { background: #fef9c3; color: #713f12; }
+    .status-stub    { background: #fce7f3; color: #831843; }
+    .status-outdated{ background: #ffedd5; color: #7c2d12; }
+    .status-archived{ background: #f1f5f9; color: #64748b; }
+  </style>
+</head>
+<body>
+  <h1>📚 Wiki Index</h1>
+  <p class="stats">${stats.totalPages} pages · ${stats.totalLinks} links · ${stats.deadLinks} dead links · ${stats.totalTags} tags</p>
+  <table>
+    <thead>
+      <tr>
+        <th>Title</th><th>Status</th><th>Tags</th><th>Words</th><th>Updated</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${rows}
+    </tbody>
+  </table>
+</body>
+</html>`;
+  }
+
+  // ─── Markdown bundle export ─────────────────────────────────────────────────
+
+  private async _exportMarkdownBundle(
+    pages: WikiPageRow[],
+    outputDir: string,
+    options: WikiExportOptions,
+  ): Promise<string[]> {
+    const includeMermaid = options.includeMermaidGraph ?? true;
+    const mermaidMax = options.mermaidGraphMaxNodes ?? 60;
+
+    const sections: string[] = [
+      '# Project Wiki Bundle',
+      '',
+      `> Generated by LocoWorker · ${new Date().toISOString()}`,
+      '',
+      '---',
+      '',
+      '## Table of Contents',
+      '',
+      ...pages.map((p, i) => `${i + 1}. [${p.title}](#${p.slug.replace(/-/g, '-')})`),
+      '',
+      '---',
+      '',
+    ];
+
+    for (const page of pages) {
+      const fm = JSON.parse(page.frontmatter_json) as Partial<WikiFrontmatter>;
+      const tags =
+        page.tags_csv
+          ? `**Tags:** ${page.tags_csv.split(',').map((t) => `\`${t.trim()}\``).join(' ')}`
+          : '';
+
+      sections.push(
+        `## ${page.title}`,
+        '',
+        `> **Status:** ${page.status}  `,
+        `> **Author:** ${page.author}  `,
+        tags ? `> ${tags}  ` : '',
+        fm.graphify_node ? `> **Code node:** \`${fm.graphify_node}\`  ` : '',
+        `> **Updated:** ${page.updated_at.slice(0, 10)}`,
+        '',
+        page.content,
+        '',
+        '---',
+        '',
+      );
+    }
+
+    // Mermaid link graph
+    if (includeMermaid) {
+      sections.push('## Link Graph', '', '```mermaid');
+      sections.push(this._buildMermaidGraph(pages, mermaidMax));
+      sections.push('```', '');
+    }
+
+    const outPath = join(outputDir, 'WIKI.md');
+    await writeFile(outPath, sections.filter((s) => s !== '').join('\n'), 'utf8');
+    return [outPath];
+  }
+
+  private _buildMermaidGraph(pages: WikiPageRow[], maxNodes: number): string {
+    // Use at most maxNodes pages, preferring active > draft > others
+    const priority = (p: WikiPageRow) =>
+      p.status === 'active' ? 0 : p.status === 'draft' ? 1 : 2;
+    const subset = [...pages]
+      .sort((a, b) => priority(a) - priority(b))
+      .slice(0, maxNodes);
+
+    const slugSet = new Set(subset.map((p) => p.slug));
+    const db = (this.store as unknown as {
+      db: import('better-sqlite3').Database;
+    }).db;
+
+    interface LinkRow { from_slug: string; to_slug: string }
+    const links = db
+      .prepare<[], LinkRow>(
+        'SELECT from_slug, to_slug FROM wiki_links WHERE is_dead = 0',
+      )
+      .all()
+      .filter((l) => slugSet.has(l.from_slug) && slugSet.has(l.to_slug));
+
+    const lines: string[] = ['graph LR'];
+
+    // Node definitions (truncate long titles)
+    for (const p of subset) {
+      const label = p.title.length > 25 ? p.title.slice(0, 22) + '...' : p.title;
+      lines.push(`  ${this._mermaidId(p.slug)}["${label}"]`);
+    }
+
+    // Edges (de-duplicate)
+    const seen = new Set<string>();
+    for (const link of links) {
+      const key = `${link.from_slug}→${link.to_slug}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        lines.push(
+          `  ${this._mermaidId(link.from_slug)} --> ${this._mermaidId(link.to_slug)}`,
+        );
+      }
+    }
+
+    return lines.join('\n');
+  }
+
+  private _mermaidId(slug: string): string {
+    // Mermaid node IDs must be alphanumeric (replace hyphens)
+    return slug.replace(/-/g, '_');
+  }
+
+  // ─── JSON export ────────────────────────────────────────────────────────────
+
+  private async _exportJson(
+    pages: WikiPageRow[],
+    outputDir: string,
+    options: WikiExportOptions,
+  ): Promise<string[]> {
+    const pretty = options.prettyJson ?? true;
+
+    const payload = pages.map((p) => {
+      const frontmatter = JSON.parse(p.frontmatter_json) as WikiFrontmatter;
+      const backlinks = this.store.getBacklinks(p.slug);
+      const outLinks = this.store.getLinks(p.slug);
+
+      return {
+        slug: p.slug,
+        title: p.title,
+        filePath: p.file_path,
+        status: p.status,
+        author: p.author,
+        tags: frontmatter.tags ?? [],
+        graphifyNode: p.graphify_node ?? null,
+        wordCount: p.word_count,
+        fingerprint: p.fingerprint,
+        createdAt: p.created_at,
+        updatedAt: p.updated_at,
+        frontmatter,
+        content: p.content,
+        backlinkCount: backlinks.length,
+        outLinkCount: outLinks.length,
+        deadOutLinks: outLinks.filter((l) => l.is_dead === 1).length,
+      };
+    });
+
+    const stats = this.store.getStats();
+
+    const dump = {
+      exportedAt: new Date().toISOString(),
+      pageCount: pages.length,
+      stats,
+      pages: payload,
+    };
+
+    const outPath = join(outputDir, 'wiki.json');
+    await writeFile(
+      outPath,
+      pretty ? JSON.stringify(dump, null, 2) : JSON.stringify(dump),
+      'utf8',
+    );
+    return [outPath];
+  }
+
+  // ─── HTML escape ────────────────────────────────────────────────────────────
+
+  private _escHtml(str: string): string {
+    return str
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#x27;');
+  }
+}
+src/WikiSyncAgent.ts
+TypeScript
+
+/**
+ * WikiSyncAgent — agent-triggered wiki write pipeline for @locoworker/wiki
+ *
+ * Bridges packages/core (EventBus, HooksRegistry, AgentEvent) with the
+ * wiki persistence layer (WikiStore, WikiParser, WikiLinker).
+ *
+ * Responsibilities:
+ *  - Listen for agent events that signal wiki-worthy content:
+ *      · session_end       → summarise session into a CHANGELOG wiki page
+ *      · autodream_complete → incorporate AutoDream insights into wiki pages
+ *      · tool_result       → if tool is "wiki_write", process the page write
+ *  - Process structured "[WIKI: slug] content" markers in agent messages
+ *  - Perform atomic upserts via WikiStore with author='agent'
+ *  - Emit wiki_page_written events back onto EventBus
+ *  - Run dead-link detection after every batch write
+ *  - Expose a direct write API for tools/MCP callers
+ *
+ * Core integration:
+ *  WikiSyncAgent imports from @locoworker/core ONLY via type imports where
+ *  possible. Runtime dependency on EventBus and HooksRegistry is injected
+ *  (not imported statically) so the wiki package remains usable standalone.
+ *
+ * Design notes:
+ *  - All writes are idempotent (upsert + fingerprint check).
+ *  - Writes are serialised through an async queue (no concurrent DB writes).
+ *  - The agent cannot delete pages via markers alone — deletion requires
+ *    explicit API call with human confirmation flag.
+ */
+
+import { writeFile, mkdir } from 'node:fs/promises';
+import { join, dirname } from 'node:path';
+import { existsSync } from 'node:fs';
+import type { WikiStore } from './WikiStore.js';
+import { WikiParser } from './WikiParser.js';
+import { WikiLinker } from './WikiLinker.js';
+import type { WikiPage, WikiPageAuthor, WikiUpsertOptions } from './types/wiki.types.js';
+
+// ─── Lightweight core type shims ─────────────────────────────────────────────
+// We define the minimal shapes we need from @locoworker/core so that
+// wiki can be used standalone without the full core package installed.
+
+interface AgentEvent {
+  type: string;
+  sessionId?: string;
+  [key: string]: unknown;
+}
+
+interface EventBusLike {
+  onAny(handler: (event: AgentEvent) => void | Promise<void>): () => void;
+  emit(event: AgentEvent): Promise<void>;
+}
+
+interface HooksRegistryLike {
+  register(
+    name: string,
+    handler: (payload: unknown) => unknown | Promise<unknown>,
+    priority?: number,
+  ): void;
+}
+
+// ─── Marker pattern ───────────────────────────────────────────────────────────
+
+/**
+ * Marker syntax that agents use to trigger wiki page writes inside messages:
+ *
+ *   [WIKI: slug-of-page]
+ *   ## Page Title
+ *   Content of the page...
+ *   [/WIKI]
+ *
+ * Multiple markers can appear in a single message.
+ */
+const WIKI_MARKER_REGEX =
+  /\[WIKI:\s*([a-z0-9-]+)\]\n([\s\S]*?)\[\/WIKI\]/g;
+
+// ─── Option types ─────────────────────────────────────────────────────────────
+
+export interface WikiSyncAgentOptions {
+  /** Directory where .md files are stored (and written for new agent pages). */
+  wikiDir: string;
+
+  /** Whether to write .md files to disk (as well as updating the DB index).
+   *  Default: true. Set false for DB-only mode (faster, no disk writes). */
+  writeToDisk?: boolean;
+
+  /** Whether to run dead-link detection after every write batch.
+   *  Default: true. */
+  checkDeadLinks?: boolean;
+
+  /** Throttle: minimum milliseconds between event-triggered write batches.
+   *  Default: 500ms (prevents rapid consecutive writes on busy sessions). */
+  writeThrottleMs?: number;
+}
+
+export interface WikiWriteRequest {
+  slug: string;
+  content: string;
+  filePath?: string;
+  options?: WikiUpsertOptions;
+}
+
+export interface WikiWriteResult {
+  slug: string;
+  outcome: 'inserted' | 'updated' | 'unchanged' | 'error';
+  error?: string;
+}
+
+export interface WikiSyncReport {
+  written: WikiWriteResult[];
+  deadLinks: number;
+  duration: number;
+}
+
+// ─── WikiSyncAgent ────────────────────────────────────────────────────────────
+
+export class WikiSyncAgent {
+  private readonly parser: WikiParser;
+  private readonly linker: WikiLinker;
+  private _unsubscribe: (() => void) | null = null;
+  private _writeQueue: Promise<void> = Promise.resolve();
+  private _lastWriteTime = 0;
+  private readonly _throttleMs: number;
+  private readonly _writeToDisk: boolean;
+  private readonly _checkDeadLinks: boolean;
+
+  constructor(
+    private readonly store: WikiStore,
+    private readonly options: WikiSyncAgentOptions,
+  ) {
+    this.parser = new WikiParser();
+    this.linker = new WikiLinker(store);
+    this._throttleMs = options.writeThrottleMs ?? 500;
+    this._writeToDisk = options.writeToDisk ?? true;
+    this._checkDeadLinks = options.checkDeadLinks ?? true;
+  }
+
+  // ─── EventBus integration ──────────────────────────────────────────────────
+
+  /**
+   * Attach to a core EventBus instance and begin listening for agent events.
+   * Returns `this` for chaining.
+   */
+  attachToEventBus(eventBus: EventBusLike): this {
+    this._unsubscribe = eventBus.onAny(async (event) => {
+      await this._handleEvent(event, eventBus);
+    });
+    return this;
+  }
+
+  /**
+   * Detach from EventBus. Called on session cleanup.
+   */
+  detach(): void {
+    if (this._unsubscribe) {
+      this._unsubscribe();
+      this._unsubscribe = null;
+    }
+  }
+
+  /**
+   * Register a HooksRegistry hook that pre-processes agent messages
+   * for [WIKI:] markers before the turn is finalised.
+   */
+  registerHooks(hooks: HooksRegistryLike): void {
+    hooks.register(
+      'beforeTurn',
+      async (payload: unknown) => {
+        const p = payload as { messages?: Array<{ role: string; content: string }> };
+        if (!p.messages) return payload;
+
+        // Scan assistant messages for [WIKI:] markers and queue writes
+        for (const msg of p.messages) {
+          if (msg.role === 'assistant' && typeof msg.content === 'string') {
+            const requests = this._extractMarkers(msg.content, 'agent');
+            if (requests.length > 0) {
+              // Enqueue writes but don't await — marker processing is fire-and-forget
+              void this._enqueueWrites(requests);
+            }
+          }
+        }
+
+        return payload;
+      },
+      50, // priority 50 — runs after core hooks but before output hooks
+    );
+  }
+
+  // ─── Direct write API ──────────────────────────────────────────────────────
+
+  /**
+   * Write a single wiki page from raw markdown content.
+   * This is the main entry point for tool calls and MCP clients.
+   */
+  async writePage(
+    slug: string,
+    markdownContent: string,
+    upsertOptions: WikiUpsertOptions = {},
+  ): Promise<WikiWriteResult> {
+    return this._enqueueWrite({ slug, content: markdownContent, options: upsertOptions });
+  }
+
+  /**
+   * Write multiple pages atomically (sequential, in order).
+   */
+  async writePages(requests: WikiWriteRequest[]): Promise<WikiSyncReport> {
+    const start = Date.now();
+    const written: WikiWriteResult[] = [];
+
+    for (const req of requests) {
+      const result = await this._enqueueWrite(req);
+      written.push(result);
+    }
+
+    const deadLinks = this._checkDeadLinks
+      ? this.store.getDeadLinks().length
+      : -1;
+
+    return { written, deadLinks, duration: Date.now() - start };
+  }
+
+  /**
+   * Scan a raw text string for [WIKI: slug] markers and write all found pages.
+   */
+  async processMessage(
+    messageContent: string,
+    author: WikiPageAuthor = 'agent',
+  ): Promise<WikiSyncReport> {
+    const requests = this._extractMarkers(messageContent, author);
+    if (requests.length === 0) {
+      return { written: [], deadLinks: 0, duration: 0 };
+    }
+    return this.writePages(requests);
+  }
+
+  /**
+   * Rebuild the entire wiki index from all .md files in wikiDir.
+   */
+  async fullRebuild(): Promise<{ pagesIndexed: number; errors: string[] }> {
+    const { readdir } = await import('node:fs/promises');
+    const { extname } = await import('node:path');
+
+    let files: string[] = [];
+    try {
+      const entries = await readdir(this.options.wikiDir, { recursive: true });
+      files = (entries as string[])
+        .filter((f) => extname(f) === '.md')
+        .map((f) => join(this.options.wikiDir, f));
+    } catch {
+      return { pagesIndexed: 0, errors: [`Wiki directory not found: ${this.options.wikiDir}`] };
+    }
+
+    const parseResults = await this.parser.parseFiles(files);
+    const pages: WikiPage[] = [];
+    const errors: string[] = [];
+
+    for (const result of parseResults) {
+      if (result.page) {
+        pages.push(result.page);
+      } else if (result.error) {
+        errors.push(`${result.filePath}: ${result.error.message}`);
+      }
+    }
+
+    this.store.rebuild(pages);
+    return { pagesIndexed: pages.length, errors };
+  }
+
+  // ─── Internal helpers ──────────────────────────────────────────────────────
+
+  private async _handleEvent(event: AgentEvent, eventBus: EventBusLike): Promise<void> {
+    switch (event.type) {
+      case 'session_end': {
+        // On session end, generate a session changelog page
+        const sessionId = event.sessionId ?? 'unknown';
+        const summary = (event.summary as string) ?? '';
+        if (summary) {
+          await this._writeSessionChangelog(sessionId, summary, eventBus);
+        }
+        break;
+      }
+
+      case 'autodream_complete': {
+        // AutoDream may provide wiki page content in its insights
+        const insights = event.wikiInsights as WikiWriteRequest[] | undefined;
+        if (insights && Array.isArray(insights) && insights.length > 0) {
+          const report = await this.writePages(
+            insights.map((i) => ({ ...i, options: { ...i.options, author: 'autodream' as WikiPageAuthor } })),
+          );
+          await eventBus.emit({
+            type: 'wiki_batch_written',
+            pagesWritten: report.written.length,
+            deadLinks: report.deadLinks,
+          });
+        }
+        break;
+      }
+
+      case 'tool_result': {
+        // If a wiki_write tool was used, the result contains the page request
+        const toolName = event.toolName as string | undefined;
+        if (toolName === 'wiki_write') {
+          const result = event.result as WikiWriteRequest | undefined;
+          if (result?.slug && result?.content) {
+            await this._enqueueWrite({ ...result, options: { author: 'agent' } });
+          }
+        }
+        break;
+      }
+    }
+  }
+
+  private async _writeSessionChangelog(
+    sessionId: string,
+    summary: string,
+    eventBus: EventBusLike,
+  ): Promise<void> {
+    const date = new Date().toISOString().slice(0, 10);
+    const slug = `session-log-${date}-${sessionId.slice(-6)}`;
+
+    const content = [
+      '---',
+      `title: Session Log ${date}`,
+      'tags: [session-log, auto-generated]',
+      'status: active',
+      'author: agent',
+      '---',
+      '',
+      `# Session Log — ${date}`,
+      '',
+      `> Session ID: \`${sessionId}\``,
+      '',
+      '## Summary',
+      '',
+      summary,
+    ].join('\n');
+
+    const result = await this._enqueueWrite({
+      slug,
+      content,
+      options: { author: 'agent', summary: 'Auto-generated session log' },
+    });
+
+    await eventBus.emit({
+      type: 'wiki_page_written',
+      slug,
+      outcome: result.outcome,
+    });
+  }
+
+  private _enqueueWrites(requests: WikiWriteRequest[]): Promise<WikiSyncReport> {
+    const promise = this._writeQueue.then(async () => {
+      return this.writePages(requests);
+    });
+    this._writeQueue = promise.then(() => undefined);
+    return promise;
+  }
+
+  private _enqueueWrite(request: WikiWriteRequest): Promise<WikiWriteResult> {
+    const promise = this._writeQueue.then(async () => {
+      return this._doWrite(request);
+    });
+    this._writeQueue = promise.then(() => undefined);
+    return promise;
+  }
+
+  private async _doWrite(request: WikiWriteRequest): Promise<WikiWriteResult> {
+    try {
+      const page = this.parser.parseContent(
+        request.content,
+        request.filePath ?? `${this.options.wikiDir}/${request.slug}.md`,
+      );
+
+      // Override slug to what was explicitly requested (parseContent derives
+      // slug from content title, which may differ from the requested slug)
+      page.slug = request.slug;
+
+      const upsertOptions: WikiUpsertOptions = {
+        author: 'agent',
+        ...request.options,
+      };
+
+      const outcome = this.store.upsertPage(page, upsertOptions);
+
+      // Optionally write .md file to disk
+      if (this._writeToDisk && outcome !== 'unchanged') {
+        const filePath =
+          request.filePath ?? join(this.options.wikiDir, `${request.slug}.md`);
+        await mkdir(dirname(filePath), { recursive: true });
+        await writeFile(filePath, request.content, 'utf8');
+      }
+
+      return { slug: request.slug, outcome };
+    } catch (err) {
+      return {
+        slug: request.slug,
+        outcome: 'error',
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
+
+  private _extractMarkers(
+    content: string,
+    author: WikiPageAuthor,
+  ): WikiWriteRequest[] {
+    const requests: WikiWriteRequest[] = [];
+    WIKI_MARKER_REGEX.lastIndex = 0;
+    let match: RegExpExecArray | null;
+
+    while ((match = WIKI_MARKER_REGEX.exec(content)) !== null) {
+      const slug = match[1].trim();
+      const pageContent = match[2].trim();
+
+      if (slug && pageContent) {
+        requests.push({
+          slug,
+          content: pageContent,
+          options: { author, summary: 'Written via agent marker' },
+        });
+      }
+    }
+
+    return requests;
+  }
+}
+src/WikiWatcher.ts
+TypeScript
+
+/**
+ * WikiWatcher — filesystem watcher for @locoworker/wiki
+ *
+ * Watches a wiki directory for .md file changes and automatically
+ * syncs them into WikiStore on save.
+ *
+ * Uses Node.js native fs.watch (no external dep) with debouncing
+ * to handle rapid save sequences from editors (vim, VS Code, etc.)
+ *
+ * Architecture:
+ *  - One watcher per WikiWatcher instance (watching the wikiDir recursively)
+ *  - Change events are debounced per-file (500ms default)
+ *  - Deletes are handled: page is removed from WikiStore but NOT from history
+ *  - Renames are treated as (delete old + add new)
+ *  - Watcher errors are emitted as 'error' events
+ *  - Status available via WikiWatcher.status()
+ *
+ * Note: Node.js recursive watch is only available on macOS and Windows.
+ * On Linux, a polling fallback is provided (1s interval).
+ */
+
+import { watch, type FSWatcher, existsSync, statSync } from 'node:fs';
+import { readdir, readFile } from 'node:fs/promises';
+import { join, extname, relative } from 'node:path';
+import { EventEmitter } from 'node:events';
+import type { WikiStore } from './WikiStore.js';
+import { WikiParser } from './WikiParser.js';
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+export interface WikiWatcherOptions {
+  /** Directory to watch. */
+  wikiDir: string;
+
+  /** Debounce delay in ms (default: 500). */
+  debounceMs?: number;
+
+  /** File extensions to watch (default: ['.md']). */
+  extensions?: string[];
+
+  /** Directories to ignore inside wikiDir (default: ['node_modules', '.git']). */
+  ignoreDirs?: string[];
+
+  /** Log sync events to console (default: false). */
+  verbose?: boolean;
+}
+
+export interface WikiChangeEvent {
+  type: 'upsert' | 'delete';
+  filePath: string;
+  slug: string;
+  outcome?: 'inserted' | 'updated' | 'unchanged';
+  error?: string;
+}
+
+export interface WikiWatcherStatus {
+  running: boolean;
+  wikiDir: string;
+  pendingDebounces: number;
+  totalEventsProcessed: number;
+  errors: number;
+}
+
+// ─── WikiWatcher ──────────────────────────────────────────────────────────────
+
+export class WikiWatcher extends EventEmitter {
+  private watcher: FSWatcher | null = null;
+  private pollingTimer: ReturnType<typeof setInterval> | null = null;
+  private readonly debounces = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly knownFiles = new Map<string, string>(); // filePath → fingerprint
+  private readonly parser: WikiParser;
+  private readonly ext: string[];
+  private readonly ignoreDirs: string[];
+  private readonly debounceMs: number;
+  private readonly verbose: boolean;
+  private _eventsProcessed = 0;
+  private _errors = 0;
+  private _running = false;
+
+  constructor(
+    private readonly store: WikiStore,
+    private readonly options: WikiWatcherOptions,
+  ) {
+    super();
+    this.parser = new WikiParser();
+    this.ext = options.extensions ?? ['.md'];
+    this.ignoreDirs = options.ignoreDirs ?? ['node_modules', '.git', 'dist', '.locoworker'];
+    this.debounceMs = options.debounceMs ?? 500;
+    this.verbose = options.verbose ?? false;
+  }
+
+  // ─── Lifecycle ─────────────────────────────────────────────────────────────
+
+  /**
+   * Start watching. Returns `this` for chaining.
+   * Does nothing if already running.
+   */
+  start(): this {
+    if (this._running) return this;
+    this._running = true;
+
+    const { wikiDir } = this.options;
+
+    try {
+      // Prefer native recursive watch
+      this.watcher = watch(
+        wikiDir,
+        { recursive: true, persistent: false },
+        (eventType, filename) => {
+          if (!filename) return;
+          const filePath = join(wikiDir, filename);
+          if (!this._shouldWatch(filePath)) return;
+          this._scheduleSync(filePath, eventType as 'rename' | 'change');
+        },
+      );
+
+      this.watcher.on('error', (err: Error) => {
+        this._errors++;
+        this.emit('error', err);
+
+        // Fall back to polling on watch error
+        if (!this.pollingTimer) {
+          this._startPolling();
+        }
+      });
+    } catch {
+      // Native recursive watch unavailable (Linux) — use polling
+      this._startPolling();
+    }
+
+    if (this.verbose) {
+      console.log(`[WikiWatcher] Started watching ${wikiDir}`);
+    }
+
+    return this;
+  }
+
+  /**
+   * Stop watching and clear all pending debounces.
+   */
+  stop(): void {
+    if (!this._running) return;
+    this._running = false;
+
+    for (const timer of this.debounces.values()) {
+      clearTimeout(timer);
+    }
+    this.debounces.clear();
+
+    if (this.watcher) {
+      this.watcher.close();
+      this.watcher = null;
+    }
+
+    if (this.pollingTimer) {
+      clearInterval(this.pollingTimer);
+      this.pollingTimer = null;
+    }
+
+    if (this.verbose) {
+      console.log('[WikiWatcher] Stopped.');
+    }
+  }
+
+  status(): WikiWatcherStatus {
+    return {
+      running: this._running,
+      wikiDir: this.options.wikiDir,
+      pendingDebounces: this.debounces.size,
+      totalEventsProcessed: this._eventsProcessed,
+      errors: this._errors,
+    };
+  }
+
+  // ─── Polling fallback (Linux) ───────────────────────────────────────────────
+
+  private _startPolling(): void {
+    // Snapshot current file states
+    void this._snapshotFiles();
+
+    this.pollingTimer = setInterval(async () => {
+      await this._pollForChanges();
+    }, 1000);
+  }
+
+  private async _snapshotFiles(): Promise<void> {
+    const files = await this._getAllWikiFiles();
+    for (const filePath of files) {
+      try {
+        const content = await readFile(filePath, 'utf8');
+        this.knownFiles.set(filePath, this._hash(content));
+      } catch {
+        // ignore unreadable files during snapshot
+      }
+    }
+  }
+
+  private async _pollForChanges(): Promise<void> {
+    const currentFiles = new Set(await this._getAllWikiFiles());
+
+    // Detect new/changed files
+    for (const filePath of currentFiles) {
+      try {
+        const content = await readFile(filePath, 'utf8');
+        const hash = this._hash(content);
+        const known = this.knownFiles.get(filePath);
+
+        if (known !== hash) {
+          this.knownFiles.set(filePath, hash);
+          await this._syncFile(filePath);
+        }
+      } catch {
+        // file might have been deleted between readdir and readFile
+      }
+    }
+
+    // Detect deleted files
+    for (const [filePath] of this.knownFiles) {
+      if (!currentFiles.has(filePath)) {
+        this.knownFiles.delete(filePath);
+        this._handleDelete(filePath);
+      }
+    }
+  }
+
+  private async _getAllWikiFiles(): Promise<string[]> {
+    const results: string[] = [];
+    try {
+      const entries = await readdir(this.options.wikiDir, { recursive: true });
+      for (const entry of entries as string[]) {
+        const filePath = join(this.options.wikiDir, entry);
+        if (this._shouldWatch(filePath)) {
+          results.push(filePath);
+        }
+      }
+    } catch {
+      // wikiDir may not exist yet
+    }
+    return results;
+  }
+
+  // ─── Debounced sync ─────────────────────────────────────────────────────────
+
+  private _scheduleSync(filePath: string, eventType: 'rename' | 'change'): void {
+    // Clear any existing debounce for this file
+    const existing = this.debounces.get(filePath);
+    if (existing) clearTimeout(existing);
+
+    const timer = setTimeout(async () => {
+      this.debounces.delete(filePath);
+
+      if (eventType === 'rename' || !existsSync(filePath)) {
+        // rename = possibly deleted
+        if (!existsSync(filePath)) {
+          this._handleDelete(filePath);
+        } else {
+          await this._syncFile(filePath);
+        }
+      } else {
+        await this._syncFile(filePath);
+      }
+    }, this.debounceMs);
+
+    this.debounces.set(filePath, timer);
+  }
+
+  private async _syncFile(filePath: string): Promise<void> {
+    try {
+      // Check it's still a file (not a directory)
+      const stat = statSync(filePath);
+      if (!stat.isFile()) return;
+
+      const page = await this.parser.parseFile(filePath);
+      const outcome = this.store.upsertPage(page, {
+        author: 'human',
+        summary: 'Auto-synced from file save',
+      });
+
+      this._eventsProcessed++;
+
+      const event: WikiChangeEvent = {
+        type: 'upsert',
+        filePath,
+        slug: page.slug,
+        outcome,
+      };
+
+      if (this.verbose) {
+        console.log(`[WikiWatcher] ${outcome}: ${page.slug} (${filePath})`);
+      }
+
+      this.emit('change', event);
+    } catch (err) {
+      this._errors++;
+      const event: WikiChangeEvent = {
+        type: 'upsert',
+        filePath,
+        slug: this._slugFromPath(filePath),
+        error: err instanceof Error ? err.message : String(err),
+      };
+      this.emit('change', event);
+      this.emit('error', err);
+    }
+  }
+
+  private _handleDelete(filePath: string): void {
+    const slug = this._slugFromPath(filePath);
+    const deleted = this.store.deletePage(slug, 'human', 'File deleted from disk');
+
+    this._eventsProcessed++;
+
+    const event: WikiChangeEvent = { type: 'delete', filePath, slug };
+    if (this.verbose) {
+      console.log(`[WikiWatcher] ${deleted ? 'deleted' : 'not found'}: ${slug}`);
+    }
+    this.emit('change', event);
+  }
+
+  // ─── Helpers ───────────────────────────────────────────────────────────────
+
+  private _shouldWatch(filePath: string): boolean {
+    if (!this.ext.includes(extname(filePath))) return false;
+
+    const rel = relative(this.options.wikiDir, filePath);
+    const parts = rel.split(/[\\/]/);
+    return !parts.some((p) => this.ignoreDirs.includes(p));
+  }
+
+  private _slugFromPath(filePath: string): string {
+    const name = filePath.replace(/\\/g, '/').split('/').pop() ?? '';
+    return name
+      .replace(extname(name), '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-|-$/g, '');
+  }
+
+  private _hash(content: string): string {
+    // Simple djb2 hash for fast polling comparison (not cryptographic)
+    let hash = 5381;
+    for (let i = 0; i < content.length; i++) {
+      hash = ((hash << 5) + hash) ^ content.charCodeAt(i);
+      hash |= 0;
+    }
+    return String(hash >>> 0);
+  }
+}
+src/index.ts
+TypeScript
+
+/**
+ * @locoworker/wiki — public API barrel export
+ *
+ * Core classes:
+ *   WikiStore       — SQLite persistence (pages, links, history, FTS5)
+ *   WikiParser      — Markdown → WikiPage (frontmatter, wikilinks, headings)
+ *   WikiSearch      — FTS5 full-text search + structured queries
+ *   WikiLinker      — [[wikilink]] resolution, dead-link detection, link graph
+ *   WikiExporter    — HTML / Markdown bundle / JSON export
+ *   WikiSyncAgent   — Agent-triggered page write pipeline (core EventBus integration)
+ *   WikiWatcher     — fs.watch-based auto-sync on file save
+ *
+ * Utility:
+ *   toSlug          — convert arbitrary string to kebab-case slug
+ *
+ * Types re-exported from src/types/wiki.types.ts
+ */
+
+// ─── Classes ──────────────────────────────────────────────────────────────────
+export { WikiStore } from './WikiStore.js';
+export { WikiParser, toSlug } from './WikiParser.js';
+export { WikiSearch } from './WikiSearch.js';
+export { WikiLinker } from './WikiLinker.js';
+export { WikiExporter } from './WikiExporter.js';
+export { WikiSyncAgent } from './WikiSyncAgent.js';
+export { WikiWatcher } from './WikiWatcher.js';
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+export type {
+  // Core page model
+  WikiPage,
+  WikiFrontmatter,
+  WikiLinkRef,
+  ExternalLinkRef,
+  WikiHeading,
+
+  // Enumerations
+  WikiPageStatus,
+  WikiPageAuthor,
+  WikiLinkType,
+  WikiExportFormat,
+
+  // DB row types
+  WikiPageRow,
+  WikiLinkRow,
+  WikiHistoryRow,
+  WikiFtsRow,
+
+  // Query & result types
+  WikiSearchOptions,
+  WikiSearchResult,
+  WikiBacklinkResult,
+  WikiStoreStats,
+  WikiUpsertOptions,
+} from './types/wiki.types.js';
+
+export type {
+  // WikiLinker
+  DeadLinkReport,
+  GraphifyLinkReport,
+  WikiLinkGraph,
+} from './WikiLinker.js';
+
+export type {
+  // WikiExporter
+  WikiExportOptions,
+  WikiExportResult,
+} from './WikiExporter.js';
+
+export type {
+  // WikiSyncAgent
+  WikiSyncAgentOptions,
+  WikiWriteRequest,
+  WikiWriteResult,
+  WikiSyncReport,
+} from './WikiSyncAgent.js';
+
+export type {
+  // WikiWatcher
+  WikiWatcherOptions,
+  WikiChangeEvent,
+  WikiWatcherStatus,
+} from './WikiWatcher.js';
+
+// ─── Zod schemas (for external validation) ────────────────────────────────────
+export { WikiFrontmatterSchema, WikiPageSchema } from './types/wiki.types.js';
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+export {
+  DEFAULT_WIKI_DIR,
+  DEFAULT_WIKI_DB,
+  WIKI_SCHEMA_VERSION,
+  FTS_SNIPPET_LENGTH,
+  MAX_HEADINGS,
+  WIKILINK_REGEX,
+  FRONTMATTER_DEFAULTS,
+} from './types/wiki.types.js';
+src/tests/WikiStore.test.ts
+TypeScript
+
+/**
+ * WikiStore test suite
+ * Run with: bun test src/tests/WikiStore.test.ts
+ */
+
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { WikiStore } from '../WikiStore.js';
+import type { WikiPage } from '../types/wiki.types.js';
+
+// ─── Fixtures ─────────────────────────────────────────────────────────────────
+
+function makeTestPage(overrides: Partial<WikiPage> = {}): WikiPage {
+  const now = new Date().toISOString();
+  return {
+    slug: 'tool-registry',
+    title: 'Tool Registry',
+    filePath: 'tool-registry.md',
+    content: 'The [[PermissionGate]] enforces access control.\n\nSee also [[Session Manager]].',
+    html: undefined,
+    frontmatter: {
+      title: 'Tool Registry',
+      tags: ['core', 'tools'],
+      status: 'active',
+      author: 'human',
+      related: [],
+      hidden: false,
+    },
+    wikilinks: [
+      {
+        raw: '[[PermissionGate]]',
+        targetSlug: 'permission-gate',
+        displayText: 'PermissionGate',
+        linkType: 'references',
+        line: 1,
+        isDead: false,
+      },
+      {
+        raw: '[[Session Manager]]',
+        targetSlug: 'session-manager',
+        displayText: 'Session Manager',
+        linkType: 'references',
+        line: 3,
+        isDead: false,
+      },
+    ],
+    externalLinks: [],
+    headings: [{ level: 1, text: 'Tool Registry', anchor: 'tool-registry', line: 1 }],
+    wordCount: 12,
+    fingerprint: 'a'.repeat(64),
+    createdAt: now,
+    updatedAt: now,
+    ...overrides,
+  };
+}
+
+function makePermGatePage(): WikiPage {
+  const now = new Date().toISOString();
+  return {
+    slug: 'permission-gate',
+    title: 'Permission Gate',
+    filePath: 'permission-gate.md',
+    content: 'Controls access via 5 permission tiers.',
+    html: undefined,
+    frontmatter: {
+      title: 'Permission Gate',
+      tags: ['core', 'security'],
+      status: 'active',
+      author: 'human',
+      related: [],
+      hidden: false,
+    },
+    wikilinks: [],
+    externalLinks: [],
+    headings: [],
+    wordCount: 7,
+    fingerprint: 'b'.repeat(64),
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+// ─── Test setup ───────────────────────────────────────────────────────────────
+
+let store: WikiStore;
+
+beforeEach(() => {
+  // Use in-memory DB for tests (no disk I/O, no cleanup needed)
+  store = new WikiStore(':memory:');
+});
+
+afterEach(() => {
+  store.close();
+});
+
+// ─── Schema & init ────────────────────────────────────────────────────────────
+
+describe('WikiStore — initialisation', () => {
+  it('opens without error and reports zero pages', () => {
+    const stats = store.getStats();
+    expect(stats.totalPages).toBe(0);
+    expect(stats.totalLinks).toBe(0);
+  });
+
+  it('getPage returns undefined for unknown slug', () => {
+    expect(store.getPage('nonexistent')).toBeUndefined();
+  });
+});
+
+// ─── Upsert ───────────────────────────────────────────────────────────────────
+
+describe('WikiStore — upsertPage', () => {
+  it('inserts a new page and returns "inserted"', () => {
+    const page = makeTestPage();
+    const outcome = store.upsertPage(page);
+    expect(outcome).toBe('inserted');
+  });
+
+  it('persists page fields correctly', () => {
+    const page = makeTestPage();
+    store.upsertPage(page);
+    const row = store.getPage('tool-registry');
+    expect(row).toBeDefined();
+    expect(row!.title).toBe('Tool Registry');
+    expect(row!.status).toBe('active');
+    expect(row!.author).toBe('human');
+    expect(row!.tags_csv).toBe('core,tools');
+    expect(row!.word_count).toBe(12);
+    expect(row!.fingerprint).toBe('a'.repeat(64));
+  });
+
+  it('returns "unchanged" when fingerprint matches', () => {
+    const page = makeTestPage();
+    store.upsertPage(page);
+    const second = store.upsertPage(page);
+    expect(second).toBe('unchanged');
+  });
+
+  it('returns "updated" when fingerprint changes', () => {
+    const page = makeTestPage();
+    store.upsertPage(page);
+    const updated = makeTestPage({ fingerprint: 'c'.repeat(64), content: 'Updated.' });
+    const outcome = store.upsertPage(updated);
+    expect(outcome).toBe('updated');
+  });
+
+  it('forceHistory writes history even when unchanged', () => {
+    const page = makeTestPage();
+    store.upsertPage(page);
+    store.upsertPage(page, { forceHistory: true, summary: 'forced' });
+    const history = store.getHistory('tool-registry');
+    // Should have at least 2 history entries (create + forced)
+    expect(history.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('records history on first insert with change_type=create', () => {
+    store.upsertPage(makeTestPage());
+    const history = store.getHistory('tool-registry');
+    expect(history.length).toBeGreaterThanOrEqual(1);
+    expect(history[0].change_type).toBe('create');
+  });
+
+  it('records history on update with change_type=update', () => {
+    store.upsertPage(makeTestPage());
+    store.upsertPage(makeTestPage({ fingerprint: 'd'.repeat(64) }));
+    const history = store.getHistory('tool-registry', 10);
+    const types = history.map((h) => h.change_type);
+    expect(types).toContain('update');
+  });
+});
+
+// ─── Links & dead-link resolution ─────────────────────────────────────────────
+
+describe('WikiStore — links and dead-link resolution', () => {
+  it('inserts outgoing wiki links', () => {
+    store.upsertPage(makeTestPage());
+    const links = store.getLinks('tool-registry');
+    expect(links.length).toBe(2);
+    const slugs = links.map((l) => l.to_slug);
+    expect(slugs).toContain('permission-gate');
+    expect(slugs).toContain('session-manager');
+  });
+
+  it('marks links to non-existent pages as dead', () => {
+    store.upsertPage(makeTestPage());
+    const links = store.getLinks('tool-registry');
+    // Neither permission-gate nor session-manager exist yet
+    expect(links.every((l) => l.is_dead === 1)).toBe(true);
+  });
+
+  it('marks link as live when target page is later created', () => {
+    store.upsertPage(makeTestPage());
+    // permission-gate doesn't exist yet → dead
+    expect(store.getLinks('tool-registry').find((l) => l.to_slug === 'permission-gate')?.is_dead).toBe(1);
+
+    // Now create permission-gate
+    store.upsertPage(makePermGatePage());
+    const links = store.getLinks('tool-registry');
+    expect(links.find((l) => l.to_slug === 'permission-gate')?.is_dead).toBe(0);
+  });
+
+  it('getBacklinks returns pages that link to a given slug', () => {
+    store.upsertPage(makeTestPage());
+    store.upsertPage(makePermGatePage());
+    const backlinks = store.getBacklinks('permission-gate');
+    expect(backlinks.length).toBe(1);
+    expect(backlinks[0].from_slug).toBe('tool-registry');
+  });
+
+  it('getDeadLinks returns all dead links', () => {
+    store.upsertPage(makeTestPage()); // links to permission-gate (dead) and session-manager (dead)
+    const dead = store.getDeadLinks();
+    expect(dead.length).toBe(2);
+  });
+
+  it('marks incoming links as dead when page is deleted', () => {
+    store.upsertPage(makeTestPage());
+    store.upsertPage(makePermGatePage());
+    // Link is now live
+    expect(
+      store.getLinks('tool-registry').find((l) => l.to_slug === 'permission-gate')?.is_dead,
+    ).toBe(0);
+
+    // Delete the target page
+    store.deletePage('permission-gate');
+    // Link should be dead again
+    expect(
+      store.getLinks('tool-registry').find((l) => l.to_slug === 'permission-gate')?.is_dead,
+    ).toBe(1);
+  });
+});
+
+// ─── Delete ───────────────────────────────────────────────────────────────────
+
+describe('WikiStore — deletePage', () => {
+  it('returns false for non-existent slug', () => {
+    expect(store.deletePage('ghost')).toBe(false);
+  });
+
+  it('removes the page from the index', () => {
+    store.upsertPage(makeTestPage());
+    store.deletePage('tool-registry');
+    expect(store.getPage('tool-registry')).toBeUndefined();
+  });
+
+  it('records delete in history', () => {
+    store.upsertPage(makeTestPage());
+    store.deletePage('tool-registry', 'human', 'Removing outdated page');
+    const history = store.getHistory('tool-registry');
+    const deleteEntry = history.find((h) => h.change_type === 'delete');
+    expect(deleteEntry).toBeDefined();
+    expect(deleteEntry!.summary).toBe('Removing outdated page');
+  });
+});
+
+// ─── Rebuild ─────────────────────────────────────────────────────────────────
+
+describe('WikiStore — rebuild', () => {
+  it('clears existing pages and re-inserts from provided list', () => {
+    store.upsertPage(makeTestPage());
+    store.rebuild([makePermGatePage()]);
+    expect(store.getPage('tool-registry')).toBeUndefined();
+    expect(store.getPage('permission-gate')).toBeDefined();
+  });
+
+  it('resolves dead links after full rebuild', () => {
+    store.rebuild([makeTestPage(), makePermGatePage()]);
+    const links = store.getLinks('tool-registry');
+    // permission-gate exists in rebuild, so link should be live
+    expect(links.find((l) => l.to_slug === 'permission-gate')?.is_dead).toBe(0);
+    // session-manager does NOT exist → still dead
+    expect(links.find((l) => l.to_slug === 'session-manager')?.is_dead).toBe(1);
+  });
+});
+
+// ─── Stats ───────────────────────────────────────────────────────────────────
+
+describe('WikiStore — getStats', () => {
+  it('reports correct page counts', () => {
+    store.upsertPage(makeTestPage());
+    store.upsertPage(makePermGatePage());
+    const stats = store.getStats();
+    expect(stats.totalPages).toBe(2);
+    expect(stats.activePages).toBe(2);
+  });
+
+  it('reports correct link counts', () => {
+    store.upsertPage(makeTestPage()); // has 2 outgoing links
+    store.upsertPage(makePermGatePage());
+    const stats = store.getStats();
+    expect(stats.totalLinks).toBe(2);
+    expect(stats.deadLinks).toBe(1); // session-manager still dead
+  });
+
+  it('reports unique tags', () => {
+    store.upsertPage(makeTestPage());
+    store.upsertPage(makePermGatePage());
+    const stats = store.getStats();
+    // tags: core, tools, security → 3 unique tags
+    expect(stats.totalTags).toBe(3);
+  });
+
+  it('getAllPages filters by status', () => {
+    store.upsertPage(makeTestPage());
+    store.upsertPage(makeTestPage({ slug: 'draft-page', title: 'Draft Page',
+      fingerprint: 'e'.repeat(64), frontmatter: { ...makeTestPage().frontmatter, status: 'draft' } }));
+    const active = store.getAllPages('active');
+    expect(active.length).toBe(1);
+    expect(active[0].slug).toBe('tool-registry');
+  });
+});
+
+// ─── History ─────────────────────────────────────────────────────────────────
+
+describe('WikiStore — history', () => {
+  it('getRecentHistory returns entries across all pages most-recent first', () => {
+    store.upsertPage(makeTestPage());
+    store.upsertPage(makePermGatePage());
+    const hist = store.getRecentHistory(10);
+    expect(hist.length).toBeGreaterThanOrEqual(2);
+    // Should be sorted descending
+    const dates = hist.map((h) => h.changed_at);
+    const sorted = [...dates].sort().reverse();
+    expect(dates).toEqual(sorted);
+  });
+});
+src/tests/WikiParser.test.ts
+TypeScript
+
+/**
+ * WikiParser test suite
+ * Run with: bun test src/tests/WikiParser.test.ts
+ */
+
+import { describe, it, expect } from 'bun:test';
+import { WikiParser, toSlug } from '../WikiParser.js';
+
+const parser = new WikiParser();
+
+// ─── toSlug ───────────────────────────────────────────────────────────────────
+
+describe('toSlug', () => {
+  it('lowercases and hyphenates words', () => {
+    expect(toSlug('Tool Registry')).toBe('tool-registry');
+  });
+
+  it('removes special characters', () => {
+    expect(toSlug('Tool Registry & Permissions!')).toBe('tool-registry-permissions');
+  });
+
+  it('collapses multiple hyphens', () => {
+    expect(toSlug('hello---world')).toBe('hello-world');
+  });
+
+  it('trims leading and trailing hyphens', () => {
+    expect(toSlug(' --hello-- ')).toBe('hello');
+  });
+
+  it('handles already kebab-case input', () => {
+    expect(toSlug('permission-gate')).toBe('permission-gate');
+  });
+
+  it('handles empty string', () => {
+    expect(toSlug('')).toBe('');
+  });
+
+  it('handles unicode by stripping non-ASCII word chars', () => {
+    expect(toSlug('café notes')).toBe('caf-notes');
+  });
+});
+
+// ─── parseContent ─────────────────────────────────────────────────────────────
+
+describe('WikiParser.parseContent — basic fields', () => {
+  const rawMd = `---
+title: My Test Page
+tags: [alpha, beta]
+status: active
+author: human
+---
+
+# My Test Page
+
+This links to [[Another Page]] and [[Third Page|Custom Text]].
+
+External: [Google](https://google.com)
+
+## Section Two
+
+More content here.
+`;
+
+  it('extracts slug from title', () => {
+    const page = parser.parseContent(rawMd, 'my-test-page.md');
+    expect(page.slug).toBe('my-test-page');
+  });
+
+  it('extracts title from frontmatter', () => {
+    const page = parser.parseContent(rawMd, 'my-test-page.md');
+    expect(page.title).toBe('My Test Page');
+  });
+
+  it('extracts tags from frontmatter', () => {
+    const page = parser.parseContent(rawMd, 'my-test-page.md');
+    expect(page.frontmatter.tags).toEqual(['alpha', 'beta']);
+  });
+
+  it('extracts status from frontmatter', () => {
+    const page = parser.parseContent(rawMd, 'my-test-page.md');
+    expect(page.frontmatter.status).toBe('active');
+  });
+
+  it('extracts author from frontmatter', () => {
+    const page = parser.parseContent(rawMd, 'my-test-page.md');
+    expect(page.frontmatter.author).toBe('human');
+  });
+
+  it('strips frontmatter from content', () => {
+    const page = parser.parseContent(rawMd, 'my-test-page.md');
+    expect(page.content).not.toContain('---');
+    expect(page.content).toContain('# My Test Page');
+  });
+
+  it('computes a non-empty fingerprint (64 hex chars)', () => {
+    const page = parser.parseContent(rawMd, 'my-test-page.md');
+    expect(page.fingerprint).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('computes word count > 0', () => {
+    const page = parser.parseContent(rawMd, 'my-test-page.md');
+    expect(page.wordCount).toBeGreaterThan(0);
+  });
+
+  it('html is undefined until render() is called', () => {
+    const page = parser.parseContent(rawMd, 'my-test-page.md');
+    expect(page.html).toBeUndefined();
+  });
+});
+
+// ─── Wikilink extraction ──────────────────────────────────────────────────────
+
+describe('WikiParser.parseContent — wikilink extraction', () => {
+  it('extracts basic [[wikilink]]', () => {
+    const page = parser.parseContent('# Test\n\nSee [[Permission Gate]].', 'test.md');
+    expect(page.wikilinks.length).toBe(1);
+    expect(page.wikilinks[0].targetSlug).toBe('permission-gate');
+    expect(page.wikilinks[0].displayText).toBe('Permission Gate');
+    expect(page.wikilinks[0].linkType).toBe('references');
+  });
+
+  it('extracts [[Page|Custom Display]] with display text', () => {
+    const page = parser.parseContent('[[Tool Registry|our registry]]', 'test.md');
+    expect(page.wikilinks[0].targetSlug).toBe('tool-registry');
+    expect(page.wikilinks[0].displayText).toBe('our registry');
+  });
+
+  it('extracts [[Page::implements]] with link type', () => {
+    const page = parser.parseContent('[[ToolRegistry::implements]]', 'test.md');
+    expect(page.wikilinks[0].linkType).toBe('implements');
+  });
+
+  it('extracts [[Page|Display::documents]] with both display and type', () => {
+    const page = parser.parseContent('[[ToolRegistry|Registry Code::documents]]', 'test.md');
+    expect(page.wikilinks[0].targetSlug).toBe('toolregistry');
+    expect(page.wikilinks[0].displayText).toBe('Registry Code');
+    expect(page.wikilinks[0].linkType).toBe('documents');
+  });
+
+  it('extracts multiple wikilinks from same page', () => {
+    const content = '[[Alpha]] and [[Beta]] and [[Gamma]].';
+    const page = parser.parseContent(content, 'test.md');
+    expect(page.wikilinks.length).toBe(3);
+  });
+
+  it('records correct line numbers', () => {
+    const content = 'Line 1\n[[Link A]]\nLine 3\n[[Link B]]';
+    const page = parser.parseContent(content, 'test.md');
+    expect(page.wikilinks[0].line).toBe(2);
+    expect(page.wikilinks[1].line).toBe(4);
+  });
+
+  it('isDead defaults to false (resolved later by WikiStore)', () => {
+    const page = parser.parseContent('[[Nonexistent Page]]', 'test.md');
+    expect(page.wikilinks[0].isDead).toBe(false);
+  });
+});
+
+// ─── External link extraction ─────────────────────────────────────────────────
+
+describe('WikiParser.parseContent — external links', () => {
+  it('extracts http URLs', () => {
+    const page = parser.parseContent('[Docs](https://example.com/docs)', 'test.md');
+    expect(page.externalLinks.length).toBe(1);
+    expect(page.externalLinks[0].url).toBe('https://example.com/docs');
+    expect(page.externalLinks[0].displayText).toBe('Docs');
+  });
+
+  it('does not extract wikilinks as external links', () => {
+    const page = parser.parseContent('[[Internal Page]] and [Ext](https://x.com)', 'test.md');
+    expect(page.externalLinks.length).toBe(1);
+  });
+});
+
+// ─── Heading extraction ───────────────────────────────────────────────────────
+
+describe('WikiParser.parseContent — headings', () => {
+  const md = `# Title\n\n## Section One\n\n### Sub Section\n\n## Section Two`;
+
+  it('extracts headings with correct levels', () => {
+    const page = parser.parseContent(md, 'test.md');
+    expect(page.headings.map((h) => h.level)).toEqual([1, 2, 3, 2]);
+  });
+
+  it('extracts heading text', () => {
+    const page = parser.parseContent(md, 'test.md');
+    expect(page.headings[0].text).toBe('Title');
+    expect(page.headings[1].text).toBe('Section One');
+  });
+
+  it('generates anchor fragments', () => {
+    const page = parser.parseContent(md, 'test.md');
+    expect(page.headings[0].anchor).toBe('title');
+    expect(page.headings[2].anchor).toBe('sub-section');
+  });
+});
+
+// ─── Title and slug derivation ────────────────────────────────────────────────
+
+describe('WikiParser — title/slug derivation priority', () => {
+  it('uses frontmatter title over H1 in body', () => {
+    const md = `---\ntitle: FM Title\n---\n# H1 Title\n`;
+    const page = parser.parseContent(md, 'test.md');
+    expect(page.title).toBe('FM Title');
+    expect(page.slug).toBe('fm-title');
+  });
+
+  it('falls back to H1 when frontmatter title is absent', () => {
+    const md = `---\ntags: [x]\n---\n# My H1 Title\n`;
+    const page = parser.parseContent(md, 'test.md');
+    expect(page.title).toBe('My H1 Title');
+    expect(page.slug).toBe('my-h1-title');
+  });
+
+  it('falls back to filename slug when no title or H1', () => {
+    const md = `Just some content with no heading.`;
+    const page = parser.parseContent(md, 'my-special-file.md');
+    expect(page.slug).toBe('my-special-file');
+  });
+});
+
+// ─── Frontmatter defaults ─────────────────────────────────────────────────────
+
+describe('WikiParser — frontmatter defaults', () => {
+  it('applies status=draft when not specified', () => {
+    const page = parser.parseContent('# Test', 'test.md');
+    expect(page.frontmatter.status).toBe('draft');
+  });
+
+  it('applies author=human when not specified', () => {
+    const page = parser.parseContent('# Test', 'test.md');
+    expect(page.frontmatter.author).toBe('human');
+  });
+
+  it('applies empty tags when not specified', () => {
+    const page = parser.parseContent('# Test', 'test.md');
+    expect(page.frontmatter.tags).toEqual([]);
+  });
+
+  it('applies hidden=false when not specified', () => {
+    const page = parser.parseContent('# Test', 'test.md');
+    expect(page.frontmatter.hidden).toBe(false);
+  });
+});
+
+// ─── Render ───────────────────────────────────────────────────────────────────
+
+describe('WikiParser.render', () => {
+  it('returns an HTML string', () => {
+    const page = parser.parseContent('# Hello\n\nWorld.', 'test.md');
+    const html = parser.render(page);
+    expect(typeof html).toBe('string');
+    expect(html).toContain('<h1>');
+    expect(html).toContain('World');
+  });
+
+  it('sets page.html', () => {
+    const page = parser.parseContent('# Hello', 'test.md');
+    parser.render(page);
+    expect(page.html).toBeDefined();
+  });
+
+  it('converts [[wikilinks]] to anchor tags with data-wiki-slug', () => {
+    const page = parser.parseContent('See [[Permission Gate]].', 'test.md');
+    const html = parser.render(page);
+    expect(html).toContain('data-wiki-slug="permission-gate"');
+    expect(html).toContain('href="/wiki/permission-gate"');
+  });
+});
+
+// ─── generateStub ────────────────────────────────────────────────────────────
+
+describe('WikiParser.generateStub', () => {
+  it('generates a stub page with correct slug', () => {
+    const stub = parser.generateStub('missing-page', 'tool-registry');
+    expect(stub.slug).toBe('missing-page');
+  });
+
+  it('sets status to stub', () => {
+    const stub = parser.generateStub('missing-page', 'tool-registry');
+    expect(stub.frontmatter.status).toBe('stub');
+  });
+
+  it('sets author to agent', () => {
+    const stub = parser.generateStub('missing-page', 'tool-registry');
+    expect(stub.frontmatter.author).toBe('agent');
+  });
+
+  it('contains the referencing slug in content', () => {
+    const stub = parser.generateStub('missing-page', 'tool-registry');
+    expect(stub.content).toContain('tool-registry');
+  });
+
+  it('has a valid 64-char fingerprint', () => {
+    const stub = parser.generateStub('missing-page', 'tool-registry');
+    expect(stub.fingerprint).toMatch(/^[0-9a-f]{64}$/);
+  });
+});
+
+// ─── parseFiles (batch) ───────────────────────────────────────────────────────
+
+describe('WikiParser.parseFiles', () => {
+  it('returns error for non-existent file without throwing', async () => {
+    const results = await parser.parseFiles(['/definitely/does/not/exist.md']);
+    expect(results.length).toBe(1);
+    expect(results[0].error).toBeDefined();
+    expect(results[0].page).toBeUndefined();
+  });
+});
+src/tests/WikiSearch.test.ts
+TypeScript
+
+/**
+ * WikiSearch test suite
+ * Run with: bun test src/tests/WikiSearch.test.ts
+ */
+
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { WikiStore } from '../WikiStore.js';
+import { WikiSearch } from '../WikiSearch.js';
+import type { WikiPage } from '../types/wiki.types.js';
+
+// ─── Fixtures ─────────────────────────────────────────────────────────────────
+
+function makePage(
+  slug: string,
+  title: string,
+  content: string,
+  extra: Partial<WikiPage> = {},
+): WikiPage {
+  const now = new Date().toISOString();
+  return {
+    slug,
+    title,
+    filePath: `${slug}.md`,
+    content,
+    html: undefined,
+    frontmatter: {
+      title,
+      tags: extra.frontmatter?.tags ?? [],
+      status: extra.frontmatter?.status ?? 'active',
+      author: extra.frontmatter?.author ?? 'human',
+      related: [],
+      hidden: extra.frontmatter?.hidden ?? false,
+    },
+    wikilinks: extra.wikilinks ?? [],
+    externalLinks: [],
+    headings: [],
+    wordCount: content.split(/\s+/).length,
+    fingerprint: Buffer.from(slug + content).toString('hex').slice(0, 64).padEnd(64, '0'),
+    createdAt: now,
+    updatedAt: now,
+    ...extra,
+  };
+}
+
+// ─── Test setup ───────────────────────────────────────────────────────────────
+
+let store: WikiStore;
+let search: WikiSearch;
+
+beforeEach(() => {
+  store = new WikiStore(':memory:');
+  search = new WikiSearch(store);
+
+  // Seed test pages
+  const pages: WikiPage[] = [
+    makePage(
+      'tool-registry',
+      'Tool Registry',
+      'The ToolRegistry manages all tool registrations and executes them with permission gating.',
+      { frontmatter: { title: 'Tool Registry', tags: ['core', 'tools'], status: 'active', author: 'human', related: [], hidden: false } },
+    ),
+    makePage(
+      'permission-gate',
+      'Permission Gate',
+      'PermissionGate enforces 5 tiers: READ_ONLY, WRITE_LOCAL, NETWORK, SHELL, DANGEROUS.',
+      { frontmatter: { title: 'Permission Gate', tags: ['core', 'security'], status: 'active', author: 'human', related: [], hidden: false } },
+    ),
+    makePage(
+      'session-manager',
+      'Session Manager',
+      'SessionManager creates AgentContext with budget profiles and permission defaults.',
+      { frontmatter: { title: 'Session Manager', tags: ['core'], status: 'draft', author: 'agent', related: [], hidden: false } },
+    ),
+    makePage(
+      'autodream-notes',
+      'AutoDream Notes',
+      'AutoDream runs overnight consolidation of memory entries into insights.',
+      { frontmatter: { title: 'AutoDream Notes', tags: ['memory', 'autodream'], status: 'active', author: 'autodream', related: [], hidden: false } },
+    ),
+    makePage(
+      'hidden-page',
+      'Hidden Page',
+      'This page is hidden from public search results.',
+      { frontmatter: { title: 'Hidden Page', tags: [], status: 'active', author: 'human', related: [], hidden: true } },
+    ),
+    makePage(
+      'archived-page',
+      'Archived Page',
+      'This page has been archived and is no longer relevant.',
+      { frontmatter: { title: 'Archived Page', tags: ['legacy'], status: 'archived', author: 'human', related: [], hidden: false } },
+    ),
+  ];
+
+  // page with wikilinks for backlink/orphan tests
+  const pageWithLinks: WikiPage = {
+    ...makePage(
+      'query-loop',
+      'Query Loop',
+      'The queryLoop calls [[Tool Registry]] and checks [[Permission Gate]].',
+      { frontmatter: { title: 'Query Loop', tags: ['core', 'loop'], status: 'active', author: 'human', related: [], hidden: false } },
+    ),
+    wikilinks: [
+      { raw: '[[Tool Registry]]', targetSlug: 'tool-registry', displayText: 'Tool Registry', linkType: 'references', line: 1, isDead: false },
+      { raw: '[[Permission Gate]]', targetSlug: 'permission-gate', displayText: 'Permission Gate', linkType: 'references', line: 1, isDead: false },
+    ],
+  };
+
+  store.rebuild([...pages, pageWithLinks]);
+});
+
+afterEach(() => {
+  store.close();
+});
+
+// ─── Structured search ────────────────────────────────────────────────────────
+
+describe('WikiSearch — structured search (no FTS query)', () => {
+  it('returns all visible pages when no filters applied', () => {
+    // hidden + archived should be excluded with default options
+    const results = search.search({ limit: 20 });
+    const slugs = results.map((r) => r.slug);
+    expect(slugs).not.toContain('hidden-page');
+  });
+
+  it('filters by single status', () => {
+    const results = search.search({ status: 'draft' });
+    expect(results.length).toBe(1);
+    expect(results[0].slug).toBe('session-manager');
+  });
+
+  it('filters by multiple statuses', () => {
+    const results = search.search({ status: ['draft', 'active'], limit: 20 });
+    const slugs = results.map((r) => r.slug);
+    expect(slugs).toContain('session-manager');
+    expect(slugs).toContain('tool-registry');
+    expect(slugs).not.toContain('archived-page');
+  });
+
+  it('filters by author', () => {
+    const results = search.search({ author: 'autodream' });
+    expect(results.length).toBe(1);
+    expect(results[0].slug).toBe('autodream-notes');
+  });
+
+  it('filters by single tag', () => {
+    const results = search.search({ tags: ['security'] });
+    expect(results.length).toBe(1);
+    expect(results[0].slug).toBe('permission-gate');
+  });
+
+  it('filters by multiple tags (AND semantics)', () => {
+    const results = search.search({ tags: ['core', 'tools'] });
+    expect(results.length).toBe(1);
+    expect(results[0].slug).toBe('tool-registry');
+  });
+
+  it('returns empty array when no pages match filters', () => {
+    const results = search.search({ tags: ['nonexistent-tag'] });
+    expect(results.length).toBe(0);
+  });
+
+  it('respects limit and offset', () => {
+    const first = search.search({ status: 'active', limit: 2, offset: 0 });
+    const second = search.search({ status: 'active', limit: 2, offset: 2 });
+    const firstSlugs = first.map((r) => r.slug);
+    const secondSlugs = second.map((r) => r.slug);
+    // No overlap
+    for (const s of secondSlugs) {
+      expect(firstSlugs).not.toContain(s);
+    }
+  });
+});
+
+// ─── Backlinks ────────────────────────────────────────────────────────────────
+
+describe('WikiSearch — getBacklinks', () => {
+  it('returns pages that link to the target slug', () => {
+    const backlinks = search.getBacklinks('tool-registry');
+    expect(backlinks.length).toBe(1);
+    expect(backlinks[0].fromSlug).toBe('query-loop');
+  });
+
+  it('returns empty array for page with no backlinks', () => {
+    const backlinks = search.getBacklinks('autodream-notes');
+    expect(backlinks.length).toBe(0);
+  });
+
+  it('includes correct linkType', () => {
+    const backlinks = search.getBacklinks('tool-registry');
+    expect(backlinks[0].linkType).toBe('references');
+  });
+});
+
+// ─── Orphan detection ─────────────────────────────────────────────────────────
+
+describe('WikiSearch — getOrphans', () => {
+  it('returns pages with no incoming links', () => {
+    const orphans = search.getOrphans();
+    const slugs = orphans.map((r) => r.slug);
+    // autodream-notes, session-manager, query-loop have no backlinks
+    expect(slugs).toContain('autodream-notes');
+    expect(slugs).toContain('session-manager');
+    // tool-registry and permission-gate have backlinks from query-loop
+    expect(slugs).not.toContain('tool-registry');
+    expect(slugs).not.toContain('permission-gate');
+  });
+
+  it('excludes hidden pages from orphan results', () => {
+    const orphans = search.getOrphans();
+    expect(orphans.map((r) => r.slug)).not.toContain('hidden-page');
+  });
+
+  it('excludes archived pages from orphan results', () => {
+    const orphans = search.getOrphans();
+    expect(orphans.map((r) => r.slug)).not.toContain('archived-page');
+  });
+});
+
+// ─── Dead-link pages ──────────────────────────────────────────────────────────
+
+describe('WikiSearch — getPagesWithDeadLinks', () => {
+  it('returns pages that have dead links', () => {
+    // Rebuild with a page that has a dead link to a non-existent slug
+    const deadLinker: WikiPage = {
+      ...makePage('dead-linker', 'Dead Linker', 'See [[Ghost Page]].'),
+      wikilinks: [
+        { raw: '[[Ghost Page]]', targetSlug: 'ghost-page', displayText: 'Ghost Page', linkType: 'references', line: 1, isDead: true },
+      ],
+    };
+    store.upsertPage(deadLinker);
+
+    const pagesWithDead = search.getPagesWithDeadLinks();
+    const slugs = pagesWithDead.map((p) => p.slug);
+    expect(slugs).toContain('dead-linker');
+  });
+
+  it('returns dead link counts per page', () => {
+    const page: WikiPage = {
+      ...makePage('multi-dead', 'Multi Dead', 'See [[Ghost A]] and [[Ghost B]].'),
+      wikilinks: [
+        { raw: '[[Ghost A]]', targetSlug: 'ghost-a', displayText: 'Ghost A', linkType: 'references', line: 1, isDead: true },
+        { raw: '[[Ghost B]]', targetSlug: 'ghost-b', displayText: 'Ghost B', linkType: 'references', line: 1, isDead: true },
+      ],
+    };
+    store.upsertPage(page);
+
+    const pagesWithDead = search.getPagesWithDeadLinks();
+    const entry = pagesWithDead.find((p) => p.slug === 'multi-dead');
+    expect(entry?.deadLinkCount).toBe(2);
+  });
+});
+
+// ─── Related pages ────────────────────────────────────────────────────────────
+
+describe('WikiSearch — getRelated', () => {
+  it('returns pages with shared tags as related', () => {
+    const related = search.getRelated('tool-registry');
+    const slugs = related.map((r) => r.slug);
+    // permission-gate shares 'core' tag
+    expect(slugs).toContain('permission-gate');
+  });
+
+  it('returns empty array for unknown slug', () => {
+    const related = search.getRelated('does-not-exist');
+    expect(related.length).toBe(0);
+  });
+
+  it('does not include the page itself in related', () => {
+    const related = search.getRelated('tool-registry');
+    expect(related.map((r) => r.slug)).not.toContain('tool-registry');
+  });
+
+  it('respects limit', () => {
+    const related = search.getRelated('tool-registry', 1);
+    expect(related.length).toBeLessThanOrEqual(1);
+  });
+});
+
+// ─── Tags ────────────────────────────────────────────────────────────────────
+
+describe('WikiSearch — getAllTags', () => {
+  it('returns all unique tags with counts', () => {
+    const tags = search.getAllTags();
+    const tagNames = tags.map((t) => t.tag);
+    expect(tagNames).toContain('core');
+    expect(tagNames).toContain('security');
+    expect(tagNames).toContain('memory');
+  });
+
+  it('sorts by count descending', () => {
+    const tags = search.getAllTags();
+    // 'core' appears in tool-registry, permission-gate, session-manager, query-loop → highest count
+    expect(tags[0].tag).toBe('core');
+  });
+
+  it('returns correct count for a tag', () => {
+    const tags = search.getAllTags();
+    const core = tags.find((t) => t.tag === 'core');
+    expect(core?.count).toBeGreaterThanOrEqual(3);
+  });
+});
+src/tests/WikiLinker.test.ts
+TypeScript
+
+/**
+ * WikiLinker test suite
+ * Run with: bun test src/tests/WikiLinker.test.ts
+ */
+
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { WikiStore } from '../WikiStore.js';
+import { WikiLinker } from '../WikiLinker.js';
+import type { WikiPage } from '../types/wiki.types.js';
+
+// ─── Fixtures ─────────────────────────────────────────────────────────────────
+
+function makePage(slug: string, title: string, wikilinks: WikiPage['wikilinks'] = []): WikiPage {
+  const now = new Date().toISOString();
+  return {
+    slug,
+    title,
+    filePath: `${slug}.md`,
+    content: `# ${title}\n\nContent for ${title}.`,
+    html: undefined,
+    frontmatter: {
+      title,
+      tags: ['test'],
+      status: 'active',
+      author: 'human',
+      related: [],
+      hidden: false,
+    },
+    wikilinks,
+    externalLinks: [],
+    headings: [],
+    wordCount: 5,
+    fingerprint: Buffer.from(slug).toString('hex').slice(0, 64).padEnd(64, '0'),
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function makeLink(
+  targetSlug: string,
+  isDead = false,
+  linkType: WikiPage['wikilinks'][0]['linkType'] = 'references',
+  line = 1,
+): WikiPage['wikilinks'][0] {
+  return {
+    raw: `[[${targetSlug}]]`,
+    targetSlug,
+    displayText: targetSlug,
+    linkType,
+    line,
+    isDead,
+  };
+}
+
+// ─── Test setup ───────────────────────────────────────────────────────────────
+
+let store: WikiStore;
+let linker: WikiLinker;
+
+beforeEach(() => {
+  store = new WikiStore(':memory:');
+  linker = new WikiLinker(store);
+});
+
+afterEach(() => {
+  store.close();
+});
+
+// ─── Dead-link report ────────────────────────────────────────────────────────
+
+describe('WikiLinker — getDeadLinkReport', () => {
+  it('returns zero dead links when all links are resolved', () => {
+    const pages = [
+      makePage('page-a', 'Page A', [makeLink('page-b', false)]),
+      makePage('page-b', 'Page B'),
+    ];
+    store.rebuild(pages);
+    const report = linker.getDeadLinkReport();
+    expect(report.totalDeadLinks).toBe(0);
+    expect(report.byPage.length).toBe(0);
+    expect(report.unresolvedTargets.length).toBe(0);
+  });
+
+  it('reports dead links for missing targets', () => {
+    const pages = [
+      makePage('page-a', 'Page A', [makeLink('ghost-page', false)]),
+    ];
+    store.rebuild(pages);
+    const report = linker.getDeadLinkReport();
+    expect(report.totalDeadLinks).toBe(1);
+    expect(report.unresolvedTargets).toContain('ghost-page');
+  });
+
+  it('groups dead links by source page', () => {
+    const pages = [
+      makePage('page-a', 'Page A', [
+        makeLink('ghost-1', false, 'references', 1),
+        makeLink('ghost-2', false, 'references', 2),
+      ]),
+    ];
+    store.rebuild(pages);
+    const report = linker.getDeadLinkReport();
+    expect(report.byPage.length).toBe(1);
+    expect(report.byPage[0].slug).toBe('page-a');
+    expect(report.byPage[0].deadLinks.length).toBe(2);
+  });
+
+  it('deduplicates unresolvedTargets across pages', () => {
+    const pages = [
+      makePage('page-a', 'Page A', [makeLink('ghost', false, 'references', 1)]),
+      makePage('page-b', 'Page B', [makeLink('ghost', false, 'references', 1)]),
+    ];
+    store.rebuild(pages);
+    const report = linker.getDeadLinkReport();
+    // 'ghost' appears in both pages but should appear once in unresolvedTargets
+    expect(report.unresolvedTargets.filter((t) => t === 'ghost').length).toBe(1);
+  });
+
+  it('includes candidate suggestions for dead links', () => {
+    const pages = [
+      makePage('permission-gate', 'Permission Gate'),
+      makePage('linker', 'Linker', [makeLink('permission-gates', false)]), // slight typo
+    ];
+    store.rebuild(pages);
+    const report = linker.getDeadLinkReport();
+    const deadLink = report.byPage[0]?.deadLinks[0];
+    // Should suggest 'permission-gate' as a candidate for 'permission-gates'
+    expect(deadLink?.candidates).toContain('permission-gate');
+  });
+
+  it('sorts dead links within a page by line number', () => {
+    const pages = [
+      makePage('page-a', 'Page A', [
+        makeLink('ghost-c', false, 'references', 5),
+        makeLink('ghost-a', false, 'references', 1),
+        makeLink('ghost-b', false, 'references', 3),
+      ]),
+    ];
+    store.rebuild(pages);
+    const report = linker.getDeadLinkReport();
+    const lines = report.byPage[0].deadLinks.map((l) => l.line);
+    expect(lines).toEqual([1, 3, 5]);
+  });
+});
+
+// ─── Graphify link cross-reference ───────────────────────────────────────────
+
+describe('WikiLinker — checkGraphifyLinks', () => {
+  it('reports valid graphify links', () => {
+    const now = new Date().toISOString();
+    const page: WikiPage = {
+      ...makePage('tool-registry-doc', 'Tool Registry Doc'),
+      frontmatter: {
+        title: 'Tool Registry Doc',
+        tags: [],
+        status: 'active',
+        author: 'human',
+        related: [],
+        hidden: false,
+        graphify_node: 'ToolRegistry',
+      },
+    };
+    store.upsertPage(page);
+
+    const knownNodes = new Set(['ToolRegistry', 'PermissionGate', 'EventBus']);
+    const report = linker.checkGraphifyLinks(knownNodes);
+
+    expect(report.validGraphifyLinks.length).toBe(1);
+    expect(report.validGraphifyLinks[0].graphifyNode).toBe('ToolRegistry');
+    expect(report.brokenGraphifyLinks.length).toBe(0);
+  });
+
+  it('reports broken graphify links', () => {
+    const page: WikiPage = {
+      ...makePage('broken-doc', 'Broken Doc'),
+      frontmatter: {
+        title: 'Broken Doc',
+        tags: [],
+        status: 'active',
+        author: 'human',
+        related: [],
+        hidden: false,
+        graphify_node: 'NonExistentClass',
+      },
+    };
+    store.upsertPage(page);
+
+    const knownNodes = new Set(['ToolRegistry', 'PermissionGate']);
+    const report = linker.checkGraphifyLinks(knownNodes);
+
+    expect(report.brokenGraphifyLinks.length).toBe(1);
+    expect(report.brokenGraphifyLinks[0].graphifyNode).toBe('NonExistentClass');
+  });
+
+  it('skips pages without graphify_node', () => {
+    store.upsertPage(makePage('no-link', 'No Link'));
+    const report = linker.checkGraphifyLinks(new Set(['Anything']));
+    expect(report.validGraphifyLinks.length).toBe(0);
+    expect(report.brokenGraphifyLinks.length).toBe(0);
+  });
+});
+
+// ─── Link graph ───────────────────────────────────────────────────────────────
+
+describe('WikiLinker — buildLinkGraph', () => {
+  it('builds correct outgoing adjacency from live links', () => {
+    const pages = [
+      makePage('a', 'A', [makeLink('b', false)]),
+      makePage('b', 'B', [makeLink('c', false)]),
+      makePage('c', 'C'),
+    ];
+    store.rebuild(pages);
+    const graph = linker.buildLinkGraph();
+    expect(graph.outgoing.get('a')?.has('b')).toBe(true);
+    expect(graph.outgoing.get('b')?.has('c')).toBe(true);
+    expect(graph.outgoing.get('c')?.size).toBe(0);
+  });
+
+  it('builds correct incoming adjacency', () => {
+    const pages = [
+      makePage('a', 'A', [makeLink('b', false)]),
+      makePage('b', 'B'),
+    ];
+    store.rebuild(pages);
+    const graph = linker.buildLinkGraph();
+    expect(graph.incoming.get('b')?.has('a')).toBe(true);
+  });
+
+  it('excludes dead links from graph', () => {
+    // ghost-page doesn't exist, so its link will be dead after rebuild
+    const pages = [
+      makePage('a', 'A', [makeLink('ghost', false)]),
+    ];
+    store.rebuild(pages);
+    const graph = linker.buildLinkGraph();
+    // 'ghost' is not in allSlugs (no page for it), so not in outgoing
+    expect(graph.outgoing.get('a')?.has('ghost')).toBeFalsy();
+  });
+
+  it('includes all pages in allSlugs', () => {
+    const pages = [makePage('x', 'X'), makePage('y', 'Y'), makePage('z', 'Z')];
+    store.rebuild(pages);
+    const graph = linker.buildLinkGraph();
+    expect(graph.allSlugs.has('x')).toBe(true);
+    expect(graph.allSlugs.has('y')).toBe(true);
+    expect(graph.allSlugs.has('z')).toBe(true);
+  });
+});
+
+// ─── resolveLinks ─────────────────────────────────────────────────────────────
+
+describe('WikiLinker — resolveLinks', () => {
+  it('marks link as dead when target not in slug index', () => {
+    const page = makePage('test', 'Test', [makeLink('missing', false)]);
+    const slugIndex = new Set(['existing', 'test']);
+    linker.resolveLinks(page, slugIndex);
+    expect(page.wikilinks[0].isDead).toBe(true);
+  });
+
+  it('marks link as live when target is in slug index', () => {
+    const page = makePage('test', 'Test', [makeLink('existing', false)]);
+    const slugIndex = new Set(['existing', 'test']);
+    linker.resolveLinks(page, slugIndex);
+    expect(page.wikilinks[0].isDead).toBe(false);
+  });
+
+  it('mutates in place and returns the same page object', () => {
+    const page = makePage('test', 'Test', [makeLink('x', false)]);
+    const result = linker.resolveLinks(page, new Set(['x']));
+    expect(result).toBe(page);
+  });
+});
+
+// ─── Stub generation ─────────────────────────────────────────────────────────
+
+describe('WikiLinker — generateStubsForDeadLinks', () => {
+  it('generates one stub per unresolved target', () => {
+    const report = {
+      totalDeadLinks: 2,
+      byPage: [],
+      unresolvedTargets: ['ghost-a', 'ghost-b'],
+    };
+    const stubs = linker.generateStubsForDeadLinks(report, 'source-page');
+    expect(stubs.length).toBe(2);
+    expect(stubs.map((s) => s.slug)).toContain('ghost-a');
+    expect(stubs.map((s) => s.slug)).toContain('ghost-b');
+  });
+
+  it('generates stubs with status=stub', () => {
+    const report = { totalDeadLinks: 1, byPage: [], unresolvedTargets: ['orphan'] };
+    const stubs = linker.generateStubsForDeadLinks(report, 'source');
+    expect(stubs[0].frontmatter.status).toBe('stub');
+  });
+
+  it('returns empty array when no unresolved targets', () => {
+    const report = { totalDeadLinks: 0, byPage: [], unresolvedTargets: [] };
+    const stubs = linker.generateStubsForDeadLinks(report, 'source');
+    expect(stubs.length).toBe(0);
+  });
+});
+
+// ─── Candidate suggestion ─────────────────────────────────────────────────────
+
+describe('WikiLinker — slug candidate suggestions (internal)', () => {
+  it('suggests close slug matches via dead-link report', () => {
+    const pages = [
+      makePage('event-bus', 'Event Bus'),
+      makePage('typo-linker', 'Typo Linker', [makeLink('event-buss', false)]), // typo
+    ];
+    store.rebuild(pages);
+    const report = linker.getDeadLinkReport();
+    const candidates = report.byPage[0]?.deadLinks[0]?.candidates ?? [];
+    // 'event-bus' should be suggested for 'event-buss'
+    expect(candidates).toContain('event-bus');
+  });
+
+  it('does not suggest wildly different slugs', () => {
+    const pages = [
+      makePage('completely-unrelated-concept', 'Unrelated'),
+      makePage('typo-linker', 'Typo Linker', [makeLink('event-bus', false)]),
+    ];
+    store.rebuild(pages);
+    const report = linker.getDeadLinkReport();
+    const candidates = report.byPage[0]?.deadLinks[0]?.candidates ?? [];
+    expect(candidates).not.toContain('completely-unrelated-concept');
+  });
+});
+Pass 5 — Part 2 Complete ✅
+Full package summary
+File	Purpose	Lines (approx)
+Part 1		
+package.json	Package config	45
+tsconfig.json	Compiler config	20
+src/types/wiki.types.ts	Full type ABI, Zod schemas, constants	~250
+src/WikiStore.ts	SQLite persistence, 4-table schema, WAL, upsert, dead-link resolution, stats	~380
+src/WikiParser.ts	Frontmatter parse, wikilink/heading/URL extraction, render, batch parse, stub gen	~320
+src/WikiSearch.ts	FTS5 search, structured queries, backlinks, orphans, related pages, tag index	~340
+src/WikiLinker.ts	Dead-link report, graphify cross-ref, link graph, fuzzy slug suggestion	~270
+Part 2		
+src/WikiExporter.ts	HTML bundle, Markdown bundle + Mermaid graph, JSON dump	~380
+src/WikiSyncAgent.ts	EventBus integration, hooks, [WIKI:] markers, async write queue, rebuild	~290
+src/WikiWatcher.ts	fs.watch + polling fallback, debounce, auto-upsert on save, delete handling	~270
+src/index.ts	Barrel export — all classes, types, schemas, constants	~75
+src/tests/WikiStore.test.ts	28 tests covering upsert, links, dead-link resolution, delete, rebuild, stats	~230
+src/tests/WikiParser.test.ts	30 tests covering slug, parse, wikilinks, headings, render, stubs, batch	~220
+src/tests/WikiSearch.test.ts	22 tests covering structured search, backlinks, orphans, dead-link pages, related, tags	~210
+src/tests/WikiLinker.test.ts	20 tests covering dead-link report, graphify refs, link graph, resolve, stubs	~210
+Key design decisions upheld throughout
+Decision	Rationale
+WikiStore is the sole writer — all other classes are read-only	Prevents concurrent DB write races; single point of audit
+FTS5 content= external table	SQLite keeps FTS in sync via triggers — no manual double-write
+Fingerprint-gated upsert	Identical content on disk is a no-op — safe to call on every file save
+Graphify is optional peer dep	WikiLinker accepts Set<string> instead of importing GraphifyClient — wiki works standalone
+[WIKI: slug]...[/WIKI] markers	Agent has an explicit, unambiguous control surface for wiki writes without needing tool calls
+Async write queue in WikiSyncAgent	Serialises all DB writes from EventBus events — prevents race conditions when events fire rapidly
+Polling fallback in WikiWatcher	Native recursive fs.watch isn't available on Linux — polling ensures cross-platform correctness
+Dead links resolved at insert time	WikiStore always re-evaluates dead/live status after every upsert — no stale dead-link state
+Mermaid graph capped at N nodes	Large wikis produce unreadable graphs; capping with priority ordering keeps output useful
+Deterministic fingerprints	SHA-256 of raw file content (incl. frontmatter) — consistent with IncrementalUpdater in graphify
