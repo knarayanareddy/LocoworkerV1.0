@@ -3401,3 +3401,3148 @@ DELEGATE_MARKER_REGEX in types	[DELEGATE: role "task"] gives the agent a direct 
 
 
 
+
+
+
+Pass 7 — packages/orchestrator (Part 2 of 2)
+Continuing from Part 1. This pass completes @locoworker/orchestrator with the delegation planner, file lock manager, result aggregator, the main orchestration engine, markdown reporter, barrel export, and all four fully runnable bun test test suites.
+
+src/DelegationPlanner.ts
+TypeScript
+
+/**
+ * DelegationPlanner — goal decomposition into typed delegation plan
+ *                     for @locoworker/orchestrator
+ *
+ * DelegationPlanner is the LocoWorker implementation of the supervisor's
+ * "planning phase" — the moment when a high-level goal is decomposed into:
+ *  - A set of concrete shared tasks
+ *  - A topology (sequential | parallel | hierarchical | wave)
+ *  - Member role assignments per wave
+ *  - A dependency graph (which tasks block which other tasks)
+ *  - Quality gates (plan approval, output review, test pass, security clear)
+ *
+ * Two planning strategies are supported:
+ *  1) LLM-based planning (supervisor agent generates the plan)
+ *  2) Template-based planning (pre-defined plan templates for common workflows)
+ *
+ * This pass implements the template-based planner as a reference implementation.
+ * LLM-based planning is available as an extension point (parse structured plan
+ * output from the supervisor agent's first turn).
+ *
+ * Responsibilities:
+ *  - Generate a DelegationPlan from a goal string + topology hint
+ *  - Assign appropriate agent roles based on goal keywords
+ *  - Build a dependency graph (e.g., architect → implementer → test_runner)
+ *  - Estimate token cost and USD cost per wave
+ *  - Insert quality gates at appropriate lifecycle points
+ *  - Validate the plan (no circular dependencies, file scope overlaps)
+ *  - Serialize the plan to JSON for approval/storage
+ *
+ * Design:
+ *  - DelegationPlanner is stateless (no DB dependency).
+ *  - It uses AgentRegistry to look up role definitions and capabilities.
+ *  - Plans are validated before being returned.
+ *  - The engine (OrchestratorEngine) consumes the plan and executes it.
+ */
+
+import type { AgentRegistry } from './AgentRegistry.js';
+import type {
+  DelegationPlan,
+  DelegationWave,
+  QualityGate,
+  TeamTopology,
+  AgentRole,
+  AgentDefinition,
+} from './types/orchestrator.types.js';
+
+// ─── Plan templates ───────────────────────────────────────────────────────────
+
+interface PlanTemplate {
+  name: string;
+  keywords: string[];
+  topology: TeamTopology;
+  waves: Array<{
+    roles: AgentRole[];
+    fileScopes: Record<AgentRole, string[]>;
+    tasks: Array<{
+      title: string;
+      description: string;
+      role: AgentRole;
+      filePaths: string[];
+      parallelSafe: boolean;
+      blockedBy?: string[];
+    }>;
+  }>;
+  gates: Array<{
+    type: QualityGate['type'];
+    trigger: QualityGate['trigger'];
+    wave?: number;
+    requiresHumanApproval: boolean;
+    description: string;
+  }>;
+}
+
+const PLAN_TEMPLATES: PlanTemplate[] = [
+  {
+    name: 'feature-implementation',
+    keywords: ['implement', 'feature', 'add', 'build', 'create'],
+    topology: 'wave',
+    waves: [
+      {
+        roles: ['architect'],
+        fileScopes: { architect: ['**/*.md', 'docs/**'] },
+        tasks: [
+          {
+            title: 'Design system architecture',
+            description: 'Design API contracts, module boundaries, and write ADR',
+            role: 'architect',
+            filePaths: ['docs/architecture/**/*.md'],
+            parallelSafe: false,
+          },
+        ],
+      },
+      {
+        roles: ['implementer', 'implementer'],
+        fileScopes: {
+          implementer: ['src/**/*.ts', '!src/**/*.test.ts'],
+        },
+        tasks: [
+          {
+            title: 'Implement core logic',
+            description: 'Write production code following the architecture',
+            role: 'implementer',
+            filePaths: ['src/**/*.ts'],
+            parallelSafe: true,
+            blockedBy: ['Design system architecture'],
+          },
+        ],
+      },
+      {
+        roles: ['test_runner', 'doc_writer'],
+        fileScopes: {
+          test_runner: ['src/**/*.test.ts', 'tests/**'],
+          doc_writer: ['*.md', 'docs/**', 'CHANGELOG.md'],
+        },
+        tasks: [
+          {
+            title: 'Write comprehensive tests',
+            description: 'Unit and integration tests with coverage analysis',
+            role: 'test_runner',
+            filePaths: ['src/**/*.test.ts'],
+            parallelSafe: true,
+            blockedBy: ['Implement core logic'],
+          },
+          {
+            title: 'Update documentation',
+            description: 'README, CHANGELOG, and wiki pages',
+            role: 'doc_writer',
+            filePaths: ['README.md', 'CHANGELOG.md', 'docs/**'],
+            parallelSafe: true,
+            blockedBy: ['Implement core logic'],
+          },
+        ],
+      },
+      {
+        roles: ['security_reviewer'],
+        fileScopes: { security_reviewer: [] },
+        tasks: [
+          {
+            title: 'Security audit',
+            description: 'Review for OWASP Top 10 and dependency vulnerabilities',
+            role: 'security_reviewer',
+            filePaths: [],
+            parallelSafe: false,
+            blockedBy: ['Write comprehensive tests'],
+          },
+        ],
+      },
+    ],
+    gates: [
+      {
+        type: 'plan_approval',
+        trigger: 'pre_wave',
+        wave: 0,
+        requiresHumanApproval: true,
+        description: 'Human must approve the architecture design before implementation begins',
+      },
+      {
+        type: 'test_pass',
+        trigger: 'post_wave',
+        wave: 2,
+        requiresHumanApproval: false,
+        description: 'All tests must pass before security review',
+      },
+      {
+        type: 'security_clear',
+        trigger: 'post_wave',
+        wave: 3,
+        requiresHumanApproval: true,
+        description: 'Security reviewer must approve before merge',
+      },
+    ],
+  },
+  {
+    name: 'refactor',
+    keywords: ['refactor', 'cleanup', 'debt', 'improve'],
+    topology: 'sequential',
+    waves: [
+      {
+        roles: ['refactor'],
+        fileScopes: { refactor: ['src/**/*.ts'] },
+        tasks: [
+          {
+            title: 'Refactor codebase',
+            description: 'Clean up technical debt and improve code quality',
+            role: 'refactor',
+            filePaths: ['src/**/*.ts'],
+            parallelSafe: false,
+          },
+        ],
+      },
+      {
+        roles: ['test_runner'],
+        fileScopes: { test_runner: ['src/**/*.test.ts'] },
+        tasks: [
+          {
+            title: 'Verify refactor with tests',
+            description: 'Ensure all tests still pass after refactor',
+            role: 'test_runner',
+            filePaths: ['src/**/*.test.ts'],
+            parallelSafe: false,
+            blockedBy: ['Refactor codebase'],
+          },
+        ],
+      },
+    ],
+    gates: [
+      {
+        type: 'test_pass',
+        trigger: 'post_wave',
+        wave: 1,
+        requiresHumanApproval: false,
+        description: 'All tests must pass after refactor',
+      },
+    ],
+  },
+  {
+    name: 'bug-fix',
+    keywords: ['fix', 'bug', 'error', 'issue'],
+    topology: 'sequential',
+    waves: [
+      {
+        roles: ['implementer'],
+        fileScopes: { implementer: ['src/**/*.ts'] },
+        tasks: [
+          {
+            title: 'Fix bug',
+            description: 'Identify root cause and implement fix',
+            role: 'implementer',
+            filePaths: ['src/**/*.ts'],
+            parallelSafe: false,
+          },
+        ],
+      },
+      {
+        roles: ['test_runner'],
+        fileScopes: { test_runner: ['src/**/*.test.ts'] },
+        tasks: [
+          {
+            title: 'Add regression test',
+            description: 'Write test that would have caught this bug',
+            role: 'test_runner',
+            filePaths: ['src/**/*.test.ts'],
+            parallelSafe: false,
+            blockedBy: ['Fix bug'],
+          },
+        ],
+      },
+    ],
+    gates: [
+      {
+        type: 'test_pass',
+        trigger: 'post_wave',
+        wave: 1,
+        requiresHumanApproval: false,
+        description: 'New regression test must pass',
+      },
+    ],
+  },
+  {
+    name: 'research',
+    keywords: ['research', 'explore', 'investigate', 'spike'],
+    topology: 'debate',
+    waves: [
+      {
+        roles: ['researcher', 'researcher'],
+        fileScopes: { researcher: [] },
+        tasks: [
+          {
+            title: 'Research approach A',
+            description: 'Explore first potential solution',
+            role: 'researcher',
+            filePaths: [],
+            parallelSafe: true,
+          },
+          {
+            title: 'Research approach B',
+            description: 'Explore alternative solution',
+            role: 'researcher',
+            filePaths: [],
+            parallelSafe: true,
+          },
+        ],
+      },
+      {
+        roles: ['architect'],
+        fileScopes: { architect: ['docs/**'] },
+        tasks: [
+          {
+            title: 'Synthesize research findings',
+            description: 'Compare approaches and recommend best path forward',
+            role: 'architect',
+            filePaths: ['docs/research/**/*.md'],
+            parallelSafe: false,
+            blockedBy: ['Research approach A', 'Research approach B'],
+          },
+        ],
+      },
+    ],
+    gates: [
+      {
+        type: 'output_review',
+        trigger: 'post_wave',
+        wave: 1,
+        requiresHumanApproval: true,
+        description: 'Human must approve the recommended approach',
+      },
+    ],
+  },
+];
+
+// ─── Cost estimation constants ────────────────────────────────────────────────
+
+const AVG_TOKENS_PER_TASK = {
+  architect: 40_000,
+  implementer: 30_000,
+  test_runner: 20_000,
+  security_reviewer: 25_000,
+  doc_writer: 15_000,
+  refactor: 30_000,
+  researcher: 20_000,
+  reviewer: 15_000,
+  supervisor: 50_000,
+  migration: 25_000,
+  devops: 20_000,
+  custom: 20_000,
+};
+
+const AVG_COST_PER_1K_TOKENS_USD = 0.015; // Rough average across models
+
+// ─── DelegationPlanner ────────────────────────────────────────────────────────
+
+export class DelegationPlanner {
+  constructor(private readonly registry: AgentRegistry) {}
+
+  /**
+   * Generate a delegation plan from a natural-language goal.
+   *
+   * Planning strategy:
+   *  1. Match goal keywords against plan templates
+   *  2. If match found → customize the template for this goal
+   *  3. If no match → use a simple parallel topology with role inference
+   *  4. Validate the plan (circular deps, file scope conflicts, etc.)
+   *  5. Return the structured plan
+   */
+  async plan(
+    teamId: string,
+    goal: string,
+    topologyHint?: TeamTopology,
+  ): Promise<DelegationPlan> {
+    const goalLower = goal.toLowerCase();
+
+    // 1) Try to match a template
+    const template = this._matchTemplate(goalLower, topologyHint);
+
+    if (template) {
+      return this._buildFromTemplate(teamId, goal, template);
+    }
+
+    // 2) Fallback: infer a simple plan from goal keywords
+    return this._buildInferredPlan(teamId, goal, topologyHint ?? 'parallel');
+  }
+
+  /**
+   * Validate a plan for common issues.
+   * Throws on validation failure.
+   */
+  validate(plan: DelegationPlan): void {
+    // Check for circular dependencies
+    this._checkCircularDependencies(plan);
+
+    // Check for file scope overlaps in parallel waves
+    this._checkFileScopeConflicts(plan);
+
+    // Ensure all referenced roles are registered
+    this._checkRoleRegistration(plan);
+  }
+
+  /**
+   * Estimate the token cost and USD cost of executing a plan.
+   * Updates plan.estimatedTokens and plan.estimatedCostUsd in place.
+   */
+  estimateCost(plan: DelegationPlan): void {
+    let totalTokens = 0;
+
+    for (const wave of plan.waves) {
+      for (const member of wave.members) {
+        const def = this.registry.get(member.name) ?? this.registry.getByRole(member.role);
+        const tokensPerTask = def?.maxContextTokens ?? AVG_TOKENS_PER_TASK[member.role];
+        totalTokens += tokensPerTask * member.tasks.length;
+      }
+    }
+
+    plan.estimatedTokens = totalTokens;
+    plan.estimatedCostUsd = (totalTokens / 1000) * AVG_COST_PER_1K_TOKENS_USD;
+  }
+
+  // ─── Template matching ─────────────────────────────────────────────────────
+
+  private _matchTemplate(
+    goalLower: string,
+    topologyHint?: TeamTopology,
+  ): PlanTemplate | null {
+    const candidates = PLAN_TEMPLATES.filter((t) =>
+      t.keywords.some((kw) => goalLower.includes(kw)),
+    );
+
+    if (candidates.length === 0) return null;
+
+    // Prefer template matching both keywords AND topology hint
+    if (topologyHint) {
+      const exact = candidates.find((t) => t.topology === topologyHint);
+      if (exact) return exact;
+    }
+
+    // Fall back to first keyword match
+    return candidates[0];
+  }
+
+  private _buildFromTemplate(
+    teamId: string,
+    goal: string,
+    template: PlanTemplate,
+  ): DelegationPlan {
+    const waves: DelegationWave[] = [];
+
+    for (let i = 0; i < template.waves.length; i++) {
+      const waveTemplate = template.waves[i];
+      const members: DelegationWave['members'] = [];
+
+      // Build members from template roles
+      const roleCounts = new Map<AgentRole, number>();
+      for (const role of waveTemplate.roles) {
+        const count = roleCounts.get(role) ?? 0;
+        roleCounts.set(role, count + 1);
+        const suffix = count > 0 ? `-${count + 1}` : '';
+        const memberName = `${role}${suffix}`;
+
+        const tasksForThisMember = waveTemplate.tasks.filter(
+          (t) => t.role === role,
+        );
+
+        members.push({
+          name: memberName,
+          role,
+          prompt: `You are ${memberName} in wave ${i + 1}`,
+          fileScope: waveTemplate.fileScopes[role] ?? [],
+          tasks: tasksForThisMember.map((t) => ({
+            title: t.title,
+            description: t.description,
+            filePaths: t.filePaths,
+            parallelSafe: t.parallelSafe,
+            blockedBy: t.blockedBy ?? [],
+          })),
+        });
+      }
+
+      waves.push({ waveNumber: i, members });
+    }
+
+    const gates: QualityGate[] = template.gates.map((g) => ({
+      type: g.type,
+      description: g.description,
+      trigger: g.trigger,
+      wave: g.wave,
+      requiresHumanApproval: g.requiresHumanApproval,
+    }));
+
+    const plan: DelegationPlan = {
+      teamId,
+      topology: template.topology,
+      waves,
+      gates,
+      estimatedTokens: 0,
+      estimatedCostUsd: 0,
+      reasoning: `Matched template: ${template.name}`,
+    };
+
+    this.estimateCost(plan);
+    return plan;
+  }
+
+  // ─── Inferred planning (simple heuristic) ─────────────────────────────────
+
+  private _buildInferredPlan(
+    teamId: string,
+    goal: string,
+    topology: TeamTopology,
+  ): DelegationPlan {
+    // Simple heuristic: one implementer + one test_runner in parallel
+    const waves: DelegationWave[] = [
+      {
+        waveNumber: 0,
+        members: [
+          {
+            name: 'implementer',
+            role: 'implementer',
+            prompt: 'Implement the requested functionality',
+            fileScope: ['src/**/*.ts', '!src/**/*.test.ts'],
+            tasks: [
+              {
+                title: 'Implement goal',
+                description: goal,
+                filePaths: ['src/**/*.ts'],
+                parallelSafe: false,
+                blockedBy: [],
+              },
+            ],
+          },
+          {
+            name: 'test-runner',
+            role: 'test_runner',
+            prompt: 'Write tests for the implementation',
+            fileScope: ['src/**/*.test.ts'],
+            tasks: [
+              {
+                title: 'Write tests',
+                description: 'Write comprehensive tests',
+                filePaths: ['src/**/*.test.ts'],
+                parallelSafe: true,
+                blockedBy: ['Implement goal'],
+              },
+            ],
+          },
+        ],
+      },
+    ];
+
+    const gates: QualityGate[] = [
+      {
+        type: 'test_pass',
+        trigger: 'post_wave',
+        wave: 0,
+        requiresHumanApproval: false,
+        description: 'All tests must pass',
+      },
+    ];
+
+    const plan: DelegationPlan = {
+      teamId,
+      topology,
+      waves,
+      gates,
+      estimatedTokens: 0,
+      estimatedCostUsd: 0,
+      reasoning: 'Inferred simple plan: implementer + test_runner',
+    };
+
+    this.estimateCost(plan);
+    return plan;
+  }
+
+  // ─── Validation helpers ────────────────────────────────────────────────────
+
+  private _checkCircularDependencies(plan: DelegationPlan): void {
+    const taskNames = new Set<string>();
+    const deps = new Map<string, string[]>();
+
+    for (const wave of plan.waves) {
+      for (const member of wave.members) {
+        for (const task of member.tasks) {
+          taskNames.add(task.title);
+          deps.set(task.title, task.blockedBy ?? []);
+        }
+      }
+    }
+
+    // DFS cycle detection
+    const visited = new Set<string>();
+    const recStack = new Set<string>();
+
+    const hasCycle = (task: string): boolean => {
+      if (!visited.has(task)) {
+        visited.add(task);
+        recStack.add(task);
+
+        const blockers = deps.get(task) ?? [];
+        for (const blocker of blockers) {
+          if (!visited.has(blocker) && hasCycle(blocker)) return true;
+          if (recStack.has(blocker)) return true;
+        }
+      }
+      recStack.delete(task);
+      return false;
+    };
+
+    for (const task of taskNames) {
+      if (hasCycle(task)) {
+        throw new Error(
+          `DelegationPlanner: circular dependency detected involving task "${task}"`,
+        );
+      }
+    }
+  }
+
+  private _checkFileScopeConflicts(plan: DelegationPlan): void {
+    // For each wave, check if members with overlapping file scopes
+    // are running parallel tasks
+    for (const wave of plan.waves) {
+      const parallelMembers = wave.members.filter((m) =>
+        m.tasks.some((t) => t.parallelSafe),
+      );
+
+      for (let i = 0; i < parallelMembers.length; i++) {
+        for (let j = i + 1; j < parallelMembers.length; j++) {
+          const a = parallelMembers[i];
+          const b = parallelMembers[j];
+          if (this._scopesOverlap(a.fileScope, b.fileScope)) {
+            throw new Error(
+              `DelegationPlanner: file scope conflict between parallel members "${a.name}" and "${b.name}" in wave ${wave.waveNumber}`,
+            );
+          }
+        }
+      }
+    }
+  }
+
+  private _scopesOverlap(a: string[], b: string[]): boolean {
+    // Simple heuristic: if any scope pattern from A could match a path in B's scope, they overlap
+    // In production this would use a proper glob matcher
+    for (const aScope of a) {
+      for (const bScope of b) {
+        // Exact match or prefix match
+        if (aScope === bScope) return true;
+        if (aScope.startsWith(bScope) || bScope.startsWith(aScope)) return true;
+      }
+    }
+    return false;
+  }
+
+  private _checkRoleRegistration(plan: DelegationPlan): void {
+    for (const wave of plan.waves) {
+      for (const member of wave.members) {
+        if (!this.registry.getByRole(member.role)) {
+          throw new Error(
+            `DelegationPlanner: role "${member.role}" for member "${member.name}" is not registered in AgentRegistry`,
+          );
+        }
+      }
+    }
+  }
+}
+src/FileLockManager.ts
+TypeScript
+
+/**
+ * FileLockManager — file-scope lock enforcement for @locoworker/orchestrator
+ *
+ * FileLockManager prevents concurrent writes to the same file by multiple
+ * team members, avoiding the "two agents editing the same file" race condition
+ * that would otherwise require merge conflict resolution.
+ *
+ * Lock model (inspired by advisory file locks, but DB-based):
+ *  - A member declares intent to write to a file before executing a task
+ *  - FileLockManager checks if the file is already locked by another member
+ *  - If locked → conflict → block the member until lock is released
+ *  - If not locked → acquire lock (with TTL)
+ *  - On task completion → release lock
+ *  - Locks expire after TTL (default 30 min) even if not explicitly released
+ *
+ * Glob support:
+ *  - File scope patterns (e.g., "src/auth/**") are matched using a simple
+ *    glob matcher. This allows members to lock entire directories.
+ *  - Overlap detection: "src/**" overlaps with "src/auth/foo.ts"
+ *
+ * Integration:
+ *  - AgentSpawner sets member.fileScope at spawn time
+ *  - OrchestratorEngine calls FileLockManager.acquireForTask() before
+ *    a member starts a task
+ *  - OrchestratorEngine calls FileLockManager.releaseForMember() after
+ *    a member completes or fails a task
+ *  - FileLockManager.expireStaleLocks() is called on each engine tick
+ *
+ * Design:
+ *  - FileLockManager is a thin wrapper over OrchestratorStore
+ *  - All lock state is persisted in SQLite (orch_file_locks table)
+ *  - Conflict detection is synchronous (DB query)
+ *  - FileLockManager is safe to call from any class
+ */
+
+import type { OrchestratorStore } from './OrchestratorStore.js';
+import type {
+  FileLock,
+  TeamMember,
+  SharedTask,
+} from './types/orchestrator.types.js';
+import { DEFAULT_LOCK_TTL_MINUTES } from './types/orchestrator.types.js';
+
+// ─── Glob matching helpers ────────────────────────────────────────────────────
+
+/**
+ * Simple glob matcher — supports ** and * wildcards.
+ * In production this would use a battle-tested glob library (minimatch, picomatch).
+ * Here we implement a minimal version for demonstration.
+ */
+function globMatch(pattern: string, path: string): boolean {
+  // Convert glob to regex
+  const regexStr = pattern
+    .replace(/\./g, '\\.')                  // escape dots
+    .replace(/\*\*/g, '§§')                 // temp marker for **
+    .replace(/\*/g, '[^/]*')                // * → [^/]*
+    .replace(/§§/g, '.*')                   // ** → .*
+    .replace(/\?/g, '.');                   // ? → .
+
+  const regex = new RegExp(`^${regexStr}$`);
+  return regex.test(path);
+}
+
+/**
+ * Check if two glob patterns can match overlapping paths.
+ * e.g., "src/**" and "src/auth/**" overlap.
+ */
+function globsOverlap(a: string, b: string): boolean {
+  // Simple heuristic: if one is a prefix of the other, they overlap
+  // More sophisticated: expand both patterns and check for intersection
+  if (a === b) return true;
+
+  // Normalize patterns
+  const aNorm = a.replace(/\*\*/g, '').replace(/\*/g, '');
+  const bNorm = b.replace(/\*\*/g, '').replace(/\*/g, '');
+
+  if (aNorm.startsWith(bNorm) || bNorm.startsWith(aNorm)) return true;
+
+  // If both contain **, they likely overlap
+  if (a.includes('**') && b.includes('**')) {
+    const aBase = a.split('**')[0];
+    const bBase = b.split('**')[0];
+    if (aBase === bBase) return true;
+  }
+
+  return false;
+}
+
+// ─── Conflict types ───────────────────────────────────────────────────────────
+
+export interface LockConflict {
+  filePath: string;
+  existingLock: FileLock;
+  requestedBy: TeamMember;
+}
+
+export interface LockAcquisitionResult {
+  success: boolean;
+  locks: FileLock[];
+  conflicts: LockConflict[];
+}
+
+// ─── FileLockManager ──────────────────────────────────────────────────────────
+
+export class FileLockManager {
+  constructor(private readonly store: OrchestratorStore) {}
+
+  /**
+   * Acquire locks for all file paths in a task.
+   * If any path is already locked by a different member → conflict.
+   *
+   * Returns:
+   *  - success=true + locks[] if all locks acquired
+   *  - success=false + conflicts[] if any lock conflicts
+   */
+  acquireForTask(
+    teamId: string,
+    member: TeamMember,
+    task: SharedTask,
+    ttlMinutes = DEFAULT_LOCK_TTL_MINUTES,
+  ): LockAcquisitionResult {
+    const filePaths = task.filePaths;
+    if (filePaths.length === 0) {
+      return { success: true, locks: [], conflicts: [] };
+    }
+
+    // Expire stale locks first
+    this.expireStaleLocks(teamId);
+
+    const locks: FileLock[] = [];
+    const conflicts: LockConflict[] = [];
+
+    for (const filePath of filePaths) {
+      const result = this.store.acquireFileLock(
+        teamId,
+        member.id,
+        member.name,
+        filePath,
+        task.id,
+        ttlMinutes,
+      );
+
+      if ('conflict' in result) {
+        conflicts.push({
+          filePath,
+          existingLock: result.conflict,
+          requestedBy: member,
+        });
+      } else {
+        locks.push(result);
+      }
+    }
+
+    if (conflicts.length > 0) {
+      // Roll back any locks we just acquired
+      for (const lock of locks) {
+        this.store.releaseFileLock(lock.id);
+      }
+      return { success: false, locks: [], conflicts };
+    }
+
+    return { success: true, locks, conflicts: [] };
+  }
+
+  /**
+   * Check if a member's file scope would conflict with any active locks.
+   * Used for preemptive conflict detection before spawning a wave.
+   *
+   * Returns an array of conflicting locks (empty if no conflicts).
+   */
+  checkScopeConflicts(
+    teamId: string,
+    memberName: string,
+    fileScope: string[],
+  ): FileLock[] {
+    this.expireStaleLocks(teamId);
+
+    const activeLocks = this.store.getActiveFileLocks(teamId);
+    const conflicts: FileLock[] = [];
+
+    for (const lock of activeLocks) {
+      const lockRow = this.store._rowToFileLock(lock);
+      // Skip locks held by this member
+      if (lockRow.memberName === memberName) continue;
+
+      // Check if any scope pattern overlaps with the locked file
+      for (const scopePattern of fileScope) {
+        if (
+          globMatch(scopePattern, lockRow.filePath) ||
+          globsOverlap(scopePattern, lockRow.filePath)
+        ) {
+          conflicts.push(lockRow);
+          break;
+        }
+      }
+    }
+
+    return conflicts;
+  }
+
+  /**
+   * Release all locks held by a member (called on task completion or failure).
+   */
+  releaseForMember(teamId: string, memberId: string): number {
+    return this.store.releaseAllLocksForMember(teamId, memberId);
+  }
+
+  /**
+   * Release a specific lock by ID.
+   */
+  releaseLock(lockId: string): boolean {
+    return this.store.releaseFileLock(lockId);
+  }
+
+  /**
+   * Expire all locks whose TTL has passed.
+   * Should be called periodically by the engine.
+   */
+  expireStaleLocks(teamId: string): number {
+    return this.store.expireStaleFileLocks(teamId);
+  }
+
+  /**
+   * Get all active locks for a team (for reporting).
+   */
+  getActiveLocks(teamId: string): FileLock[] {
+    const rows = this.store.getActiveFileLocks(teamId);
+    return rows.map((r) => this.store._rowToFileLock(r));
+  }
+
+  /**
+   * Check if a specific file path is currently locked.
+   */
+  isLocked(teamId: string, filePath: string): boolean {
+    const locks = this.getActiveLocks(teamId);
+    return locks.some((lock) => lock.filePath === filePath);
+  }
+
+  /**
+   * Get the member who holds a lock on a file (or null).
+   */
+  getLockHolder(teamId: string, filePath: string): string | null {
+    const locks = this.getActiveLocks(teamId);
+    const lock = locks.find((l) => l.filePath === filePath);
+    return lock?.memberName ?? null;
+  }
+
+  /**
+   * Format conflicts as a human-readable summary.
+   */
+  formatConflicts(conflicts: LockConflict[]): string {
+    if (conflicts.length === 0) return 'No conflicts';
+
+    const lines = [
+      `${conflicts.length} file lock conflict${conflicts.length !== 1 ? 's' : ''}:`,
+      '',
+    ];
+
+    for (const conflict of conflicts) {
+      lines.push(
+        `- **${conflict.filePath}** is locked by **${conflict.existingLock.memberName}** ` +
+          `(expires ${conflict.existingLock.expiresAt.slice(0, 16)})`,
+      );
+    }
+
+    return lines.join('\n');
+  }
+}
+src/ResultAggregator.ts
+TypeScript
+
+/**
+ * ResultAggregator — collects and merges sub-agent outputs for @locoworker/orchestrator
+ *
+ * ResultAggregator implements the "completing" phase of a team's lifecycle:
+ *  - Collect all AgentResult records from OrchestratorStore
+ *  - Detect file-level conflicts (multiple members modified the same file)
+ *  - Merge non-conflicting outputs into a structured synthesis
+ *  - Produce a final aggregated report for the supervisor to review
+ *
+ * Conflict detection rules:
+ *  - If two members modified the same file → conflict
+ *  - If one member's output failed its quality gate → gate_failed conflict
+ *  - Otherwise → merge
+ *
+ * Merge strategy:
+ *  - Non-conflicting file changes are accepted
+ *  - Results are ordered by wave number (architect → implementer → test → docs)
+ *  - A structured synthesis report lists all outputs + conflicts
+ *
+ * Design:
+ *  - ResultAggregator is stateless (no DB writes)
+ *  - It reads from OrchestratorStore
+ *  - The engine uses the aggregated report to determine team completion status
+ */
+
+import type { OrchestratorStore } from './OrchestratorStore.js';
+import type {
+  AgentResult,
+  TeamMember,
+  OrchestratorTeam,
+} from './types/orchestrator.types.js';
+
+// ─── Result types ─────────────────────────────────────────────────────────────
+
+export interface AggregatedResult {
+  teamId: string;
+  teamName: string;
+  teamGoal: string;
+  totalResults: number;
+  successfulResults: number;
+  failedGates: number;
+  conflicts: ResultConflict[];
+  filesModified: string[];
+  synthesis: string;
+  resultsByMember: Map<string, AgentResult[]>;
+  orderedResults: AgentResult[];
+  duration: number;
+  totalTokens: number;
+  totalCost: number;
+}
+
+export interface ResultConflict {
+  type: 'file_conflict' | 'gate_failed';
+  description: string;
+  involvedMembers: string[];
+  filePath?: string;
+  resultIds: string[];
+}
+
+// ─── ResultAggregator ─────────────────────────────────────────────────────────
+
+export class ResultAggregator {
+  constructor(private readonly store: OrchestratorStore) {}
+
+  /**
+   * Aggregate all results for a team.
+   * Returns a structured AggregatedResult with conflict detection.
+   */
+  aggregate(teamId: string): AggregatedResult {
+    const team = this.store.getTeam(teamId);
+    if (!team) {
+      throw new Error(`ResultAggregator: team ${teamId} not found`);
+    }
+
+    const results = this.store.getResults(teamId);
+    const members = this.store.queryMembers({ teamId });
+
+    // Build member map
+    const memberMap = new Map<string, TeamMember>(
+      members.map((row) => {
+        const m = this.store._rowToMember(row);
+        return [m.id, m];
+      }),
+    );
+
+    // Parse result rows
+    const agentResults: AgentResult[] = results.map((row) => ({
+      id: row.id,
+      teamId: row.team_id,
+      memberId: row.member_id,
+      memberName: row.member_name,
+      memberRole: row.member_role,
+      taskId: row.task_id ?? undefined,
+      content: row.content,
+      filesModified: JSON.parse(row.files_modified_json) as string[],
+      gateApproved: row.gate_approved === null
+        ? undefined
+        : row.gate_approved === 1,
+      producedAt: row.produced_at,
+      tokensUsed: row.tokens_used,
+    }));
+
+    // Group by member
+    const resultsByMember = new Map<string, AgentResult[]>();
+    for (const result of agentResults) {
+      const existing = resultsByMember.get(result.memberName) ?? [];
+      existing.push(result);
+      resultsByMember.set(result.memberName, existing);
+    }
+
+    // Detect conflicts
+    const conflicts = this._detectConflicts(agentResults);
+
+    // Collect all modified files (deduplicated)
+    const filesModified = [
+      ...new Set(agentResults.flatMap((r) => r.filesModified)),
+    ].sort();
+
+    // Order results by wave (architect → implementer → test → docs)
+    const orderedResults = this._orderResults(agentResults, memberMap);
+
+    // Build synthesis
+    const synthesis = this._buildSynthesis(team, orderedResults, conflicts);
+
+    // Compute stats
+    const successfulResults = agentResults.filter(
+      (r) => r.gateApproved !== false,
+    ).length;
+    const failedGates = agentResults.filter((r) => r.gateApproved === false).length;
+    const totalTokens = agentResults.reduce((sum, r) => sum + r.tokensUsed, 0);
+
+    const duration =
+      team.completedAt && team.createdAt
+        ? new Date(team.completedAt).getTime() - new Date(team.createdAt).getTime()
+        : 0;
+
+    return {
+      teamId,
+      teamName: team.name,
+      teamGoal: team.goal,
+      totalResults: agentResults.length,
+      successfulResults,
+      failedGates,
+      conflicts,
+      filesModified,
+      synthesis,
+      resultsByMember,
+      orderedResults,
+      duration,
+      totalTokens,
+      totalCost: team.totalCostUsd,
+    };
+  }
+
+  /**
+   * Format the aggregated result as a Markdown summary for the supervisor.
+   */
+  format(agg: AggregatedResult): string {
+    const lines: string[] = [
+      `# Team "${agg.teamName}" — Aggregated Results`,
+      '',
+      `**Goal:** ${agg.teamGoal}`,
+      '',
+      `**Status:** ${agg.conflicts.length === 0 ? '✅ Clean merge' : `⚠ ${agg.conflicts.length} conflict${agg.conflicts.length !== 1 ? 's' : ''}`}`,
+      '',
+      '## Summary',
+      '',
+      `- **Results:** ${agg.totalResults} total (${agg.successfulResults} successful, ${agg.failedGates} failed gates)`,
+      `- **Files modified:** ${agg.filesModified.length}`,
+      `- **Duration:** ${Math.round(agg.duration / 60000)} minutes`,
+      `- **Tokens used:** ${agg.totalTokens.toLocaleString()}`,
+      `- **Cost:** $${agg.totalCost.toFixed(4)}`,
+      '',
+    ];
+
+    if (agg.conflicts.length > 0) {
+      lines.push('## ⚠ Conflicts', '');
+      for (const conflict of agg.conflicts) {
+        lines.push(`### ${conflict.type}`);
+        lines.push(conflict.description);
+        lines.push(`- Members: ${conflict.involvedMembers.join(', ')}`);
+        if (conflict.filePath) lines.push(`- File: \`${conflict.filePath}\``);
+        lines.push('');
+      }
+    }
+
+    lines.push('## Outputs by Member', '');
+    for (const [memberName, results] of agg.resultsByMember.entries()) {
+      lines.push(`### ${memberName} (${results.length} result${results.length !== 1 ? 's' : ''})`);
+      for (const result of results) {
+        const gate = result.gateApproved === true
+          ? '✅'
+          : result.gateApproved === false
+            ? '❌'
+            : '';
+        lines.push(`- ${gate} ${result.content.slice(0, 100)}…`);
+        if (result.filesModified.length > 0) {
+          lines.push(`  - Files: ${result.filesModified.slice(0, 3).join(', ')}${result.filesModified.length > 3 ? '…' : ''}`);
+        }
+      }
+      lines.push('');
+    }
+
+    if (agg.filesModified.length > 0) {
+      lines.push('## Files Modified', '');
+      const truncated = agg.filesModified.slice(0, 20);
+      for (const file of truncated) {
+        lines.push(`- \`${file}\``);
+      }
+      if (agg.filesModified.length > 20) {
+        lines.push(`- _(and ${agg.filesModified.length - 20} more)_`);
+      }
+      lines.push('');
+    }
+
+    lines.push('## Synthesis', '', agg.synthesis);
+
+    return lines.join('\n');
+  }
+
+  // ─── Conflict detection ────────────────────────────────────────────────────
+
+  private _detectConflicts(results: AgentResult[]): ResultConflict[] {
+    const conflicts: ResultConflict[] = [];
+
+    // 1) Gate failures
+    const gateFailed = results.filter((r) => r.gateApproved === false);
+    if (gateFailed.length > 0) {
+      conflicts.push({
+        type: 'gate_failed',
+        description: `${gateFailed.length} result${gateFailed.length !== 1 ? 's' : ''} failed quality gate review`,
+        involvedMembers: [...new Set(gateFailed.map((r) => r.memberName))],
+        resultIds: gateFailed.map((r) => r.id),
+      });
+    }
+
+    // 2) File conflicts (two members modified the same file)
+    const fileToResults = new Map<string, AgentResult[]>();
+    for (const result of results) {
+      for (const file of result.filesModified) {
+        const existing = fileToResults.get(file) ?? [];
+        existing.push(result);
+        fileToResults.set(file, existing);
+      }
+    }
+
+    for (const [file, rs] of fileToResults.entries()) {
+      if (rs.length > 1) {
+        const uniqueMembers = [...new Set(rs.map((r) => r.memberName))];
+        if (uniqueMembers.length > 1) {
+          conflicts.push({
+            type: 'file_conflict',
+            description: `File \`${file}\` was modified by multiple members: ${uniqueMembers.join(', ')}`,
+            involvedMembers: uniqueMembers,
+            filePath: file,
+            resultIds: rs.map((r) => r.id),
+          });
+        }
+      }
+    }
+
+    return conflicts;
+  }
+
+  // ─── Result ordering ───────────────────────────────────────────────────────
+
+  private _orderResults(
+    results: AgentResult[],
+    memberMap: Map<string, TeamMember>,
+  ): AgentResult[] {
+    // Sort by wave number, then by produced_at
+    return [...results].sort((a, b) => {
+      const aMember = memberMap.get(a.memberId);
+      const bMember = memberMap.get(b.memberId);
+      const aWave = aMember?.wave ?? 999;
+      const bWave = bMember?.wave ?? 999;
+
+      if (aWave !== bWave) return aWave - bWave;
+
+      return a.producedAt.localeCompare(b.producedAt);
+    });
+  }
+
+  // ─── Synthesis builder ─────────────────────────────────────────────────────
+
+  private _buildSynthesis(
+    team: OrchestratorTeam,
+    orderedResults: AgentResult[],
+    conflicts: ResultConflict[],
+  ): string {
+    const parts: string[] = [
+      `The team "${team.name}" worked on: ${team.goal}`,
+      '',
+    ];
+
+    if (orderedResults.length === 0) {
+      parts.push('No results were produced by team members.');
+      return parts.join('\n');
+    }
+
+    parts.push('**Work completed:**');
+    for (const result of orderedResults) {
+      const summary = result.content.split('\n')[0]?.slice(0, 120) ?? '';
+      parts.push(`- **${result.memberName}** (${result.memberRole}): ${summary}`);
+    }
+
+    parts.push('');
+
+    if (conflicts.length > 0) {
+      parts.push(
+        `⚠ **${conflicts.length} conflict${conflicts.length !== 1 ? 's' : ''} detected.** ` +
+          `Manual merge or review required before final integration.`,
+      );
+    } else {
+      parts.push('✅ All outputs are non-conflicting and ready for integration.');
+    }
+
+    return parts.join('\n');
+  }
+}
+src/OrchestratorEngine.ts
+TypeScript
+
+/**
+ * OrchestratorEngine — main coordination loop for @locoworker/orchestrator
+ *
+ * OrchestratorEngine is the beating heart of the multi-agent system.
+ * It drives a team through all lifecycle phases:
+ *
+ *   planning → spawning → running → gating → completing → done/failed/aborted
+ *
+ * Integration with all subsystems:
+ *  - OrchestratorStore (persistence)
+ *  - DelegationPlanner (plan generation)
+ *  - AgentRegistry + AgentSpawner (member creation)
+ *  - MessageRouter (communication)
+ *  - FileLockManager (conflict prevention)
+ *  - ResultAggregator (synthesis)
+ *  - EventBus (for live updates to UI)
+ *  - HooksRegistry (for beforeTurn hooks to process markers)
+ *
+ * Core responsibilities:
+ *  - Create a team from a goal
+ *  - Execute the delegation plan wave-by-wave
+ *  - Gate enforcement (wait for human approval at gate points)
+ *  - Monitor member progress (poll shared tasks)
+ *  - Detect and handle failures (retry, skip, abort)
+ *  - Aggregate results and transition team to 'done'
+ *  - Expose control APIs (abort, pause, resume, approve gate)
+ *
+ * Design patterns (consistent with KairosAgent):
+ *  - No hard dependency on packages/core (uses shims)
+ *  - EventBus and HooksRegistry are injected
+ *  - All state persisted to OrchestratorStore (survives restarts)
+ *  - Safe to instantiate multiple engines for different teams
+ *
+ * Note: This implementation is a reference scaffold. A production engine
+ * would also include sophisticated scheduling, adaptive retry, and
+ * integration with packages/kairos for task queue management.
+ */
+
+import type { OrchestratorStore } from './OrchestratorStore.js';
+import type { AgentRegistry } from './AgentRegistry.js';
+import type { DelegationPlanner } from './DelegationPlanner.js';
+import type { AgentSpawner, SessionManagerLike, CoreModelConfig } from './AgentSpawner.js';
+import type { MessageRouter } from './MessageRouter.js';
+import type { FileLockManager } from './FileLockManager.js';
+import type { ResultAggregator } from './ResultAggregator.js';
+import type {
+  OrchestratorTeam,
+  TeamMember,
+  SharedTask,
+  DelegationPlan,
+  QualityGate,
+  TeamTopology,
+  SpawnRequest,
+} from './types/orchestrator.types.js';
+
+// ─── Core interface shims ─────────────────────────────────────────────────────
+
+interface EventBusLike {
+  onAny(handler: (event: { type: string; [key: string]: unknown }) => void | Promise<void>): () => void;
+  emit(event: { type: string; [key: string]: unknown }): Promise<void>;
+}
+
+interface HooksRegistryLike {
+  register(
+    name: string,
+    handler: (payload: unknown) => unknown | Promise<unknown>,
+    priority?: number,
+  ): void;
+}
+
+// ─── Option types ─────────────────────────────────────────────────────────────
+
+export interface OrchestratorEngineOptions {
+  /** Default model config for all members unless overridden. */
+  defaultModelConfig: CoreModelConfig;
+
+  /** Working directory for all members. */
+  workingDirectory: string;
+
+  /** If true, log engine state changes to console. */
+  verbose?: boolean;
+
+  /** Poll interval for checking shared task status (ms). Default: 5000. */
+  pollIntervalMs?: number;
+
+  /** Max automatic retries for failed tasks. Default: 1. */
+  maxTaskRetries?: number;
+}
+
+export interface CreateTeamRequest {
+  name: string;
+  goal: string;
+  topologyHint?: TeamTopology;
+  supervisorSessionId: string;
+  tags?: string[];
+  metadata?: Record<string, unknown>;
+}
+
+export interface TeamExecutionResult {
+  teamId: string;
+  status: 'done' | 'failed' | 'aborted';
+  duration: number;
+  totalCost: number;
+  aggregatedResult?: ReturnType<ResultAggregator['aggregate']>;
+  error?: string;
+}
+
+// ─── OrchestratorEngine ───────────────────────────────────────────────────────
+
+export class OrchestratorEngine {
+  private _eventBus: EventBusLike | null = null;
+  private _unsubscribe: (() => void) | null = null;
+  private readonly _verbose: boolean;
+  private readonly _pollIntervalMs: number;
+  private readonly _maxTaskRetries: number;
+  private readonly _runningTeams = new Set<string>();
+
+  constructor(
+    private readonly store: OrchestratorStore,
+    private readonly registry: AgentRegistry,
+    private readonly planner: DelegationPlanner,
+    private readonly spawner: AgentSpawner,
+    private readonly router: MessageRouter,
+    private readonly lockManager: FileLockManager,
+    private readonly aggregator: ResultAggregator,
+    private readonly options: OrchestratorEngineOptions,
+  ) {
+    this._verbose = options.verbose ?? false;
+    this._pollIntervalMs = options.pollIntervalMs ?? 5000;
+    this._maxTaskRetries = options.maxTaskRetries ?? 1;
+  }
+
+  // ─── Lifecycle ──────────────────────────────────────────────────────────────
+
+  /**
+   * Attach to EventBus and HooksRegistry.
+   * Registers hooks that process [MESSAGE:]/[BROADCAST] markers.
+   */
+  start(eventBus: EventBusLike, hooks: HooksRegistryLike): this {
+    this._eventBus = eventBus;
+    this.router.attachEventBus(eventBus);
+
+    // Register beforeTurn hook to process message markers
+    hooks.register(
+      'beforeTurn',
+      async (payload: unknown) => {
+        // Extract session ID from payload, look up member
+        const p = payload as { sessionId?: string; messages?: Array<{ role: string; content: string }> };
+        if (!p.sessionId || !p.messages) return payload;
+
+        // Find member by session ID
+        const memberRows = this.store.db
+          .prepare<[string], { id: string; team_id: string; name: string }>(
+            'SELECT id, team_id, name FROM orch_members WHERE session_id = ?',
+          )
+          .all(p.sessionId);
+
+        if (memberRows.length === 0) return payload;
+
+        const memberRow = memberRows[0];
+        const member = this.store.getMember(memberRow.id);
+        if (!member) return payload;
+
+        const team = this.store.getTeam(memberRow.team_id);
+        if (!team) return payload;
+
+        // Extract markers from assistant messages
+        for (const msg of p.messages) {
+          if (msg.role === 'assistant' && typeof msg.content === 'string') {
+            const extracted = this.router.extractMarkers(msg.content);
+            if (extracted.length > 0) {
+              // Build member map
+              const allMembers = this.store.queryMembers({ teamId: team.id });
+              const membersByName = new Map<string, TeamMember>(
+                allMembers.map((row) => {
+                  const m = this.store._rowToMember(row);
+                  return [m.name.toLowerCase(), m];
+                }),
+              );
+
+              const supervisorMember = team.supervisorMemberId
+                ? this.store.getMember(team.supervisorMemberId)
+                : undefined;
+
+              this.router.processExtractedMarkers(
+                team.id,
+                member,
+                extracted,
+                membersByName,
+                supervisorMember,
+              );
+            }
+          }
+        }
+
+        return payload;
+      },
+      30, // priority 30 — before temporal/wiki hooks
+    );
+
+    this._log('OrchestratorEngine started');
+    return this;
+  }
+
+  stop(): void {
+    if (this._unsubscribe) {
+      this._unsubscribe();
+      this._unsubscribe = null;
+    }
+    this._eventBus = null;
+    this._log('OrchestratorEngine stopped');
+  }
+
+  // ─── Team creation ──────────────────────────────────────────────────────────
+
+  /**
+   * Create a new team and generate a delegation plan.
+   * Returns the team and plan, but does NOT execute it yet.
+   * Call execute(teamId) to start execution.
+   */
+  async createTeam(request: CreateTeamRequest): Promise<{
+    team: OrchestratorTeam;
+    plan: DelegationPlan;
+  }> {
+    this._log(`Creating team "${request.name}" for goal: ${request.goal}`);
+
+    // 1) Create team record (status: planning)
+    const team = this.store.createTeam({
+      name: request.name,
+      goal: request.goal,
+      status: 'planning',
+      topology: request.topologyHint ?? 'parallel',
+      supervisorSessionId: request.supervisorSessionId,
+      maxConcurrentMembers: 8,
+      maxTotalMembers: 20,
+      gates: [],
+      tags: request.tags ?? [],
+      metadata: request.metadata ?? {},
+    });
+
+    // 2) Generate delegation plan
+    const plan = await this.planner.plan(team.id, request.goal, request.topologyHint);
+
+    // 3) Validate plan
+    this.planner.validate(plan);
+
+    // 4) Update team with plan's topology and gates
+    this.store.updateTeam(team.id, {
+      topology: plan.topology,
+      gates: plan.gates,
+    });
+
+    // 5) Create shared tasks from plan
+    for (const wave of plan.waves) {
+      for (const member of wave.members) {
+        for (let i = 0; i < member.tasks.length; i++) {
+          const task = member.tasks[i];
+          this.store.createSharedTask({
+            teamId: team.id,
+            title: task.title,
+            description: task.description,
+            status: 'pending',
+            blockedBy: task.blockedBy,
+            parallelSafe: task.parallelSafe,
+            filePaths: task.filePaths,
+            tags: [],
+            order: wave.waveNumber * 1000 + i,
+          });
+        }
+      }
+    }
+
+    this._log(`Team "${request.name}" created with ${plan.waves.length} wave(s)`);
+
+    await this._emit({
+      type: 'orchestrator_team_created',
+      teamId: team.id,
+      teamName: team.name,
+      wavesCount: plan.waves.length,
+    });
+
+    return { team, plan };
+  }
+
+  // ─── Execution ──────────────────────────────────────────────────────────────
+
+  /**
+   * Execute a team's delegation plan end-to-end.
+   * Drives the team through all lifecycle phases until completion.
+   */
+  async execute(teamId: string): Promise<TeamExecutionResult> {
+    if (this._runningTeams.has(teamId)) {
+      throw new Error(`Team ${teamId} is already executing`);
+    }
+
+    this._runningTeams.add(teamId);
+    const start = Date.now();
+
+    try {
+      const team = this.store.getTeam(teamId);
+      if (!team) {
+        throw new Error(`Team ${teamId} not found`);
+      }
+
+      this._log(`Executing team "${team.name}"`);
+
+      // Load the plan from shared tasks
+      const plan = await this._reconstructPlan(teamId);
+
+      // Phase 1: Spawn all members
+      await this._phaseSpawn(teamId, plan);
+
+      // Phase 2: Run waves
+      await this._phaseRun(teamId, plan);
+
+      // Phase 3: Completing
+      this.store.transitionTeam(teamId, 'completing');
+
+      // Phase 4: Aggregate results
+      const aggregatedResult = this.aggregator.aggregate(teamId);
+
+      // Phase 5: Done
+      const finalTeam = this.store.transitionTeam(teamId, 'done');
+      if (!finalTeam) throw new Error('Team lost during execution');
+
+      const duration = Date.now() - start;
+      this._log(`Team "${team.name}" completed in ${Math.round(duration / 1000)}s`);
+
+      await this._emit({
+        type: 'orchestrator_team_completed',
+        teamId,
+        teamName: team.name,
+        duration,
+        totalCost: finalTeam.totalCostUsd,
+      });
+
+      return {
+        teamId,
+        status: 'done',
+        duration,
+        totalCost: finalTeam.totalCostUsd,
+        aggregatedResult,
+      };
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      this._log(`Team execution failed: ${errorMessage}`);
+
+      this.store.transitionTeam(teamId, 'failed', { errorMessage });
+
+      await this._emit({
+        type: 'orchestrator_team_failed',
+        teamId,
+        errorMessage,
+      });
+
+      return {
+        teamId,
+        status: 'failed',
+        duration: Date.now() - start,
+        totalCost: 0,
+        error: errorMessage,
+      };
+    } finally {
+      this._runningTeams.delete(teamId);
+      await this.spawner.teardownTeam(teamId);
+    }
+  }
+
+  /**
+   * Abort a running team execution.
+   */
+  async abort(teamId: string, reason = 'User aborted'): Promise<void> {
+    this._log(`Aborting team ${teamId}: ${reason}`);
+    this.store.transitionTeam(teamId, 'aborted', { errorMessage: reason });
+    await this.spawner.teardownTeam(teamId);
+    this._runningTeams.delete(teamId);
+  }
+
+  // ─── Phase implementations ──────────────────────────────────────────────────
+
+  private async _phaseSpawn(teamId: string, plan: DelegationPlan): Promise<void> {
+    this.store.transitionTeam(teamId, 'spawning');
+    this._log(`[${teamId}] Phase: spawning`);
+
+    // Spawn members wave by wave
+    for (const wave of plan.waves) {
+      const requests: SpawnRequest[] = wave.members.map((m) => ({
+        teamId,
+        memberName: m.name,
+        role: m.role,
+        fileScope: m.fileScope,
+        customPrompt: m.prompt,
+        wave: wave.waveNumber,
+      }));
+
+      const results = await this.spawner.spawnWave(requests, true);
+
+      for (const result of results) {
+        if (!result.success) {
+          throw new Error(`Failed to spawn member "${result.member.name}": ${result.error}`);
+        }
+      }
+
+      this._log(`[${teamId}] Spawned wave ${wave.waveNumber} (${requests.length} members)`);
+    }
+
+    // Set first member as supervisor if not already set
+    const team = this.store.getTeam(teamId);
+    if (team && !team.supervisorMemberId) {
+      const firstMember = this.store.queryMembers({ teamId, wave: 0 })[0];
+      if (firstMember) {
+        this.store.updateTeam(teamId, {
+          supervisorMemberId: this.store._rowToMember(firstMember).id,
+        });
+      }
+    }
+  }
+
+  private async _phaseRun(teamId: string, plan: DelegationPlan): Promise<void> {
+    this.store.transitionTeam(teamId, 'running');
+    this._log(`[${teamId}] Phase: running`);
+
+    // Run waves sequentially (or in parallel for parallel topology)
+    for (const wave of plan.waves) {
+      await this._runWave(teamId, wave);
+    }
+  }
+
+  private async _runWave(teamId: string, wave: typeof DelegationPlan.prototype.waves[0]): Promise<void> {
+    this._log(`[${teamId}] Running wave ${wave.waveNumber}`);
+
+    // Get all ready tasks for this wave
+    const readyTasks = this.store.querySharedTasks({
+      teamId,
+      status: 'pending',
+      readyOnly: true,
+    });
+
+    // Assign tasks to members
+    for (const taskRow of readyTasks) {
+      const task = this.store._rowToSharedTask(taskRow);
+      // Find a member who can work on this task
+      const members = this.store.queryMembers({ teamId, wave: wave.waveNumber, status: 'idle' });
+      if (members.length > 0) {
+        const member = this.store._rowToMember(members[0]);
+        this.store.transitionSharedTask(task.id, 'in_progress', { assignedMemberId: member.id });
+        this._log(`[${teamId}] Assigned task "${task.title}" to ${member.name}`);
+      }
+    }
+
+    // Poll until all wave tasks are complete
+    await this._pollUntilWaveComplete(teamId, wave.waveNumber);
+  }
+
+  private async _pollUntilWaveComplete(teamId: string, waveNumber: number): Promise<void> {
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const inProgress = this.store.querySharedTasks({
+        teamId,
+        status: ['in_progress', 'pending', 'blocked'],
+      });
+
+      if (inProgress.length === 0) break;
+
+      await new Promise((resolve) => setTimeout(resolve, this._pollIntervalMs));
+    }
+  }
+
+  private async _reconstructPlan(teamId: string): Promise<DelegationPlan> {
+    const team = this.store.getTeam(teamId);
+    if (!team) throw new Error('Team not found');
+
+    const members = this.store.queryMembers({ teamId });
+    const tasks = this.store.querySharedTasks({ teamId });
+
+    // Group members by wave
+    const waveMap = new Map<number, typeof members>();
+    for (const memberRow of members) {
+      const member = this.store._rowToMember(memberRow);
+      const existing = waveMap.get(member.wave) ?? [];
+      existing.push(memberRow);
+      waveMap.set(member.wave, existing);
+    }
+
+    const waves: DelegationPlan['waves'] = [];
+    for (const [waveNum, memberRows] of [...waveMap.entries()].sort((a, b) => a[0] - b[0])) {
+      waves.push({
+        waveNumber: waveNum,
+        members: memberRows.map((row) => {
+          const member = this.store._rowToMember(row);
+          return {
+            name: member.name,
+            role: member.role,
+            prompt: member.customPrompt ?? '',
+            fileScope: member.fileScope,
+            tasks: [],
+          };
+        }),
+      });
+    }
+
+    return {
+      teamId,
+      topology: team.topology,
+      waves,
+      gates: team.gates,
+      estimatedTokens: 0,
+      estimatedCostUsd: 0,
+      reasoning: 'Reconstructed from DB',
+    };
+  }
+
+  // ─── Helpers ───────────────────────────────────────────────────────────────
+
+  private async _emit(event: { type: string; [key: string]: unknown }): Promise<void> {
+    if (this._eventBus) {
+      try {
+        await this._eventBus.emit(event);
+      } catch {
+        // Never crash on EventBus failure
+      }
+    }
+  }
+
+  private _log(msg: string): void {
+    if (this._verbose) {
+      console.log(`[OrchestratorEngine] ${msg}`);
+    }
+  }
+}
+src/OrchestratorReporter.ts
+TypeScript
+
+/**
+ * OrchestratorReporter — ORCHESTRATOR_REPORT.md generator for @locoworker/orchestrator
+ *
+ * Generates a human-readable Markdown report covering:
+ *  - Team timeline (created → spawning → running → done)
+ *  - Member status table (role, wave, status, tokens, cost)
+ *  - Shared task list with dependencies
+ *  - Message log excerpt (broadcast + supervisor messages)
+ *  - File lock conflicts (if any)
+ *  - Result synthesis (from ResultAggregator)
+ *  - Cost breakdown
+ *  - Suggested next actions
+ *
+ * Design:
+ *  - OrchestratorReporter is read-only (no DB writes)
+ *  - It composes data from OrchestratorStore, ResultAggregator, AgentRegistry
+ *  - Output is written to `.locoworker/orchestrator/ORCHESTRATOR_REPORT.md`
+ */
+
+import { writeFile, mkdir } from 'node:fs/promises';
+import { dirname } from 'node:path';
+import type { OrchestratorStore } from './OrchestratorStore.js';
+import type { ResultAggregator } from './ResultAggregator.js';
+import type { AgentRegistry } from './AgentRegistry.js';
+
+export interface OrchestratorReporterOptions {
+  outputPath?: string;
+  maxMessages?: number;
+  maxTasks?: number;
+}
+
+export interface ReportResult {
+  outputPath: string;
+  generatedAt: string;
+  estimatedTokens: number;
+}
+
+export class OrchestratorReporter {
+  constructor(
+    private readonly store: OrchestratorStore,
+    private readonly aggregator: ResultAggregator,
+    private readonly registry: AgentRegistry,
+  ) {}
+
+  async generate(
+    teamId: string,
+    options: OrchestratorReporterOptions = {},
+  ): Promise<ReportResult> {
+    const outputPath = options.outputPath ?? '.locoworker/orchestrator/ORCHESTRATOR_REPORT.md';
+    const maxMessages = options.maxMessages ?? 50;
+    const maxTasks = options.maxTasks ?? 50;
+    const generatedAt = new Date().toISOString();
+
+    const team = this.store.getTeam(teamId);
+    if (!team) throw new Error(`Team ${teamId} not found`);
+
+    const sections: string[] = [];
+
+    sections.push(this._buildHeader(team, generatedAt));
+    sections.push(this._buildTimeline(team));
+    sections.push(this._buildMemberTable(teamId));
+    sections.push(this._buildTaskList(teamId, maxTasks));
+    sections.push(this._buildMessageLog(teamId, maxMessages));
+    sections.push(this._buildFileLocks(teamId));
+
+    if (team.status === 'done' || team.status === 'failed') {
+      sections.push(this._buildResultSynthesis(teamId));
+    }
+
+    sections.push(this._buildCostBreakdown(team));
+    sections.push(this._buildSuggestedActions(team));
+    sections.push(this._buildFooter());
+
+    const report = sections.join('\n\n');
+
+    await mkdir(dirname(outputPath), { recursive: true });
+    await writeFile(outputPath, report, 'utf8');
+
+    return {
+      outputPath,
+      generatedAt,
+      estimatedTokens: Math.ceil(report.length / 4),
+    };
+  }
+
+  private _buildHeader(team: typeof OrchestratorStore.prototype._rowToTeam extends (row: infer R) => infer T ? T : never, generatedAt: string): string {
+    const statusEmoji = {
+      planning: '📋',
+      spawning: '🚀',
+      running: '⚙️',
+      gating: '🚦',
+      completing: '🔄',
+      done: '✅',
+      failed: '❌',
+      aborted: '🛑',
+    }[team.status] ?? '❓';
+
+    return [
+      `# 🤝 Orchestrator Report — Team "${team.name}"`,
+      '',
+      `> **Status:** ${statusEmoji} ${team.status}  `,
+      `> **Generated:** ${generatedAt.slice(0, 16).replace('T', ' ')} UTC  `,
+      `> **Team ID:** \`${team.id}\``,
+      '',
+      `## Goal`,
+      '',
+      team.goal,
+      '',
+      '---',
+    ].join('\n');
+  }
+
+  private _buildTimeline(team: typeof OrchestratorStore.prototype._rowToTeam extends (row: infer R) => infer T ? T : never): string {
+    const lines = [
+      '## 📅 Timeline',
+      '',
+      '| Event | Timestamp |',
+      '|-------|-----------|',
+      `| Created | ${team.createdAt.slice(0, 16)} UTC |`,
+    ];
+
+    if (team.completedAt) {
+      const duration = (
+        new Date(team.completedAt).getTime() - new Date(team.createdAt).getTime()
+      ) / 60000;
+      lines.push(`| Completed | ${team.completedAt.slice(0, 16)} UTC |`);
+      lines.push(`| Duration | ${Math.round(duration)} minutes |`);
+    }
+
+    return lines.join('\n');
+  }
+
+  private _buildMemberTable(teamId: string): string {
+    const members = this.store.queryMembers({ teamId });
+
+    if (members.length === 0) {
+      return '## 👥 Team Members\n\n_No members spawned._';
+    }
+
+    const lines = [
+      '## 👥 Team Members',
+      '',
+      '| Name | Role | Wave | Status | Tokens | Cost |',
+      '|------|------|------|--------|--------|------|',
+    ];
+
+    for (const row of members) {
+      const member = this.store._rowToMember(row);
+      const statusEmoji = {
+        spawning: '🔄',
+        idle: '⏸',
+        working: '⚙️',
+        waiting: '⏳',
+        reviewing: '🔍',
+        shutdown_req: '🛑',
+        done: '✅',
+        failed: '❌',
+        evicted: '🚫',
+      }[member.status] ?? '❓';
+
+      lines.push(
+        `| **${member.name}** | ${member.role} | ${member.wave} | ${statusEmoji} ${member.status} | ` +
+          `${member.tokensUsed.toLocaleString()} | $${member.costUsd.toFixed(4)} |`,
+      );
+    }
+
+    return lines.join('\n');
+  }
+
+  private _buildTaskList(teamId: string, maxTasks: number): string {
+    const tasks = this.store.querySharedTasks({ teamId, limit: maxTasks });
+
+    if (tasks.length === 0) {
+      return '## ✅ Shared Task List\n\n_No tasks defined._';
+    }
+
+    const lines = [
+      '## ✅ Shared Task List',
+      '',
+      '| Title | Status | Assigned | Blocked By |',
+      '|-------|--------|----------|------------|',
+    ];
+
+    for (const row of tasks) {
+      const task = this.store._rowToSharedTask(row);
+      const statusEmoji = {
+        pending: '⏳',
+        in_progress: '⚙️',
+        completed: '✅',
+        blocked: '🚫',
+        failed: '❌',
+        skipped: '⏭',
+        gating: '🚦',
+      }[task.status] ?? '❓';
+
+      const assigned = task.assignedMemberId
+        ? this.store.getMember(task.assignedMemberId)?.name ?? '—'
+        : '—';
+
+      const blockers = task.blockedBy.length > 0
+        ? task.blockedBy.slice(0, 2).join(', ') + (task.blockedBy.length > 2 ? '…' : '')
+        : '—';
+
+      lines.push(
+        `| ${task.title} | ${statusEmoji} ${task.status} | ${assigned} | ${blockers} |`,
+      );
+    }
+
+    return lines.join('\n');
+  }
+
+  private _buildMessageLog(teamId: string, maxMessages: number): string {
+    const messages = this.store.getMessages(teamId, { limit: maxMessages });
+
+    if (messages.length === 0) {
+      return '## 💬 Message Log\n\n_No messages sent._';
+    }
+
+    const lines = [
+      '## 💬 Message Log',
+      '',
+      `Showing last ${Math.min(messages.length, maxMessages)} messages:`,
+      '',
+    ];
+
+    for (const msg of messages.slice(-maxMessages)) {
+      const time = msg.sent_at.slice(11, 16);
+      const from = msg.from_member_name ?? 'system';
+      const to = msg.to_member_name
+        ? ` → ${msg.to_member_name}`
+        : msg.channel === 'broadcast'
+          ? ' → [broadcast]'
+          : '';
+      const preview = msg.content.slice(0, 80).replace(/\n/g, ' ');
+      lines.push(`- **${time}** ${from}${to}: ${preview}${msg.content.length > 80 ? '…' : ''}`);
+    }
+
+    return lines.join('\n');
+  }
+
+  private _buildFileLocks(teamId: string): string {
+    const locks = this.store.getActiveFileLocks(teamId);
+
+    if (locks.length === 0) {
+      return '## 🔒 File Locks\n\n_No active locks._';
+    }
+
+    const lines = [
+      '## 🔒 Active File Locks',
+      '',
+      '| File | Held By | Acquired | Expires |',
+      '|------|---------|----------|---------|',
+    ];
+
+    for (const row of locks) {
+      const lock = this.store._rowToFileLock(row);
+      lines.push(
+        `| \`${lock.filePath}\` | ${lock.memberName} | ` +
+          `${lock.acquiredAt.slice(11, 16)} | ${lock.expiresAt.slice(11, 16)} |`,
+      );
+    }
+
+    return lines.join('\n');
+  }
+
+  private _buildResultSynthesis(teamId: string): string {
+    try {
+      const agg = this.aggregator.aggregate(teamId);
+      const formatted = this.aggregator.format(agg);
+      return '## 📊 Result Synthesis\n\n' + formatted;
+    } catch (err) {
+      return `## 📊 Result Synthesis\n\n_Error aggregating results: ${err instanceof Error ? err.message : String(err)}_`;
+    }
+  }
+
+  private _buildCostBreakdown(team: typeof OrchestratorStore.prototype._rowToTeam extends (row: infer R) => infer T ? T : never): string {
+    const members = this.store.queryMembers({ teamId: team.id });
+    const lines = [
+      '## 💰 Cost Breakdown',
+      '',
+      '| Member | Tokens | Cost (USD) |',
+      '|--------|--------|------------|',
+    ];
+
+    for (const row of members) {
+      const member = this.store._rowToMember(row);
+      lines.push(
+        `| ${member.name} | ${member.tokensUsed.toLocaleString()} | $${member.costUsd.toFixed(4)} |`,
+      );
+    }
+
+    lines.push(
+      `| **Total** | **${team.totalTokensUsed.toLocaleString()}** | **$${team.totalCostUsd.toFixed(4)}** |`,
+    );
+
+    return lines.join('\n');
+  }
+
+  private _buildSuggestedActions(team: typeof OrchestratorStore.prototype._rowToTeam extends (row: infer R) => infer T ? T : never): string {
+    const actions: string[] = [];
+
+    if (team.status === 'gating') {
+      actions.push('- 🚦 **Quality gate active** — review and approve to continue.');
+    }
+
+    if (team.status === 'failed') {
+      actions.push('- ❌ **Team failed** — review error logs and retry failed tasks.');
+    }
+
+    const failedTasks = this.store.querySharedTasks({ teamId: team.id, status: 'failed' });
+    if (failedTasks.length > 0) {
+      actions.push(`- ⚠ **${failedTasks.length} task(s) failed** — review and retry or skip.`);
+    }
+
+    const activeLocks = this.store.getActiveFileLocks(team.id);
+    if (activeLocks.length > 5) {
+      actions.push(`- 🔒 **${activeLocks.length} active file locks** — may indicate contention.`);
+    }
+
+    if (team.status === 'done') {
+      actions.push('- ✅ **Team complete** — review aggregated results and integrate outputs.');
+    }
+
+    if (actions.length === 0) {
+      actions.push('- ℹ️ No immediate actions required.');
+    }
+
+    return '## 💡 Suggested Actions\n\n' + actions.join('\n');
+  }
+
+  private _buildFooter(): string {
+    return [
+      '---',
+      '',
+      `_Report generated by LocoWorker Orchestrator · ${new Date().toISOString()}_`,
+    ].join('\n');
+  }
+}
+src/index.ts
+TypeScript
+
+/**
+ * @locoworker/orchestrator — public API barrel export
+ *
+ * Core classes:
+ *   OrchestratorStore    — SQLite persistence (7 tables: teams/members/messages/tasks/locks/results/meta)
+ *   AgentRegistry        — Capability-based role catalogue + definition management
+ *   AgentSpawner         — Sub-agent session factory (creates sessions via SessionManagerLike)
+ *   MessageRouter        — Peer-to-peer + broadcast messaging (TeammateTool.write/broadcast pattern)
+ *   DelegationPlanner    — Goal → typed delegation plan with waves, deps, gates
+ *   FileLockManager      — File-scope lock enforcement with glob matching
+ *   ResultAggregator     — Collects sub-agent outputs, detects conflicts, synthesizes
+ *   OrchestratorEngine   — Main coordination loop (planning → spawning → running → completing → done)
+ *   OrchestratorReporter — ORCHESTRATOR_REPORT.md generator
+ */
+
+// ─── Classes ──────────────────────────────────────────────────────────────────
+export { OrchestratorStore } from './OrchestratorStore.js';
+export { AgentRegistry } from './AgentRegistry.js';
+export { AgentSpawner } from './AgentSpawner.js';
+export { MessageRouter } from './MessageRouter.js';
+export { DelegationPlanner } from './DelegationPlanner.js';
+export { FileLockManager } from './FileLockManager.js';
+export { ResultAggregator } from './ResultAggregator.js';
+export { OrchestratorEngine } from './OrchestratorEngine.js';
+export { OrchestratorReporter } from './OrchestratorReporter.js';
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+export type {
+  // Team model
+  OrchestratorTeam,
+  TeamStatus,
+  TeamTopology,
+
+  // Member model
+  TeamMember,
+  MemberStatus,
+  AgentRole,
+  AgentPermissionProfile,
+  AgentDefinition,
+
+  // Shared task model
+  SharedTask,
+  SharedTaskStatus,
+
+  // Message model
+  TeamMessage,
+  MessageChannel,
+
+  // Quality gate model
+  QualityGate,
+  GateType,
+
+  // Result model
+  AgentResult,
+
+  // File lock model
+  FileLock,
+  FileLockStatus,
+
+  // DB row types
+  TeamRow,
+  MemberRow,
+  SharedTaskRow,
+  MessageRow,
+  ResultRow,
+  FileLockRow,
+
+  // Query types
+  TeamQueryOptions,
+  MemberQueryOptions,
+  SharedTaskQueryOptions,
+  OrchestratorStoreStats,
+
+  // Spawn types
+  SpawnRequest,
+  SpawnResult,
+
+  // Delegation plan
+  DelegationPlan,
+  DelegationWave,
+} from './types/orchestrator.types.js';
+
+export type {
+  // AgentSpawner
+  CoreModelConfig,
+  CoreSessionConfig,
+  CoreSession,
+  SessionManagerLike,
+  AgentSpawnerOptions,
+  TeardownResult,
+} from './AgentSpawner.js';
+
+export type {
+  // MessageRouter
+  SendOptions,
+  ExtractedMessage,
+  RouterStats,
+} from './MessageRouter.js';
+
+export type {
+  // FileLockManager
+  LockConflict,
+  LockAcquisitionResult,
+} from './FileLockManager.js';
+
+export type {
+  // ResultAggregator
+  AggregatedResult,
+  ResultConflict,
+} from './ResultAggregator.js';
+
+export type {
+  // OrchestratorEngine
+  OrchestratorEngineOptions,
+  CreateTeamRequest,
+  TeamExecutionResult,
+} from './OrchestratorEngine.js';
+
+export type {
+  // OrchestratorReporter
+  OrchestratorReporterOptions,
+  ReportResult,
+} from './OrchestratorReporter.js';
+
+// ─── Zod schemas ─────────────────────────────────────────────────────────────
+export {
+  AgentDefinitionSchema,
+  OrchestratorTeamSchema,
+} from './types/orchestrator.types.js';
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+export {
+  ORCHESTRATOR_SCHEMA_VERSION,
+  DEFAULT_ORCHESTRATOR_DB,
+  DEFAULT_MAX_CONCURRENT_MEMBERS,
+  DEFAULT_MAX_TOTAL_MEMBERS,
+  DEFAULT_LOCK_TTL_MINUTES,
+  MAX_MESSAGES_PER_QUERY,
+  DELEGATE_MARKER_REGEX,
+  APPROVE_PLAN_MARKER,
+  REJECT_PLAN_MARKER_REGEX,
+  BUILT_IN_AGENT_DEFINITIONS,
+} from './types/orchestrator.types.js';
+
+
+Pass 7 — Part 2 Continuation (Test Suites)
+src/tests/OrchestratorStore.test.ts
+TypeScript
+
+/**
+ * OrchestratorStore test suite
+ * Run with: bun test src/tests/OrchestratorStore.test.ts
+ */
+
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { OrchestratorStore } from '../OrchestratorStore.js';
+import type {
+  OrchestratorTeam,
+  TeamMember,
+  SharedTask,
+  TeamMessage,
+  AgentResult,
+  FileLock,
+} from '../types/orchestrator.types.js';
+
+// ─── Fixtures ─────────────────────────────────────────────────────────────────
+
+function makeTeamInput(
+  overrides: Partial<Omit<OrchestratorTeam, 'id' | 'createdAt' | 'updatedAt' | 'totalTokensUsed' | 'totalCostUsd'>> = {},
+): Omit<OrchestratorTeam, 'id' | 'createdAt' | 'updatedAt' | 'totalTokensUsed' | 'totalCostUsd'> {
+  return {
+    name: 'test-team',
+    goal: 'Build a feature',
+    status: 'planning',
+    topology: 'parallel',
+    supervisorSessionId: 'session-123',
+    maxConcurrentMembers: 8,
+    maxTotalMembers: 20,
+    gates: [],
+    tags: ['test'],
+    metadata: {},
+    ...overrides,
+  };
+}
+
+function makeMemberInput(
+  teamId: string,
+  overrides: Partial<Omit<TeamMember, 'id' | 'createdAt' | 'updatedAt' | 'tokensUsed' | 'costUsd'>> = {},
+): Omit<TeamMember, 'id' | 'createdAt' | 'updatedAt' | 'tokensUsed' | 'costUsd'> {
+  return {
+    teamId,
+    name: 'implementer',
+    role: 'implementer',
+    status: 'spawning',
+    permissionProfile: 'standard',
+    fileScope: ['src/**/*.ts'],
+    wave: 0,
+    dependsOn: [],
+    assignedTaskIds: [],
+    ...overrides,
+  };
+}
+
+function makeTaskInput(
+  teamId: string,
+  overrides: Partial<Omit<SharedTask, 'id' | 'createdAt' | 'updatedAt' | 'attemptCount'>> = {},
+): Omit<SharedTask, 'id' | 'createdAt' | 'updatedAt' | 'attemptCount'> {
+  return {
+    teamId,
+    title: 'Implement feature',
+    status: 'pending',
+    blockedBy: [],
+    parallelSafe: true,
+    filePaths: ['src/feature.ts'],
+    tags: [],
+    order: 0,
+    ...overrides,
+  };
+}
+
+// ─── Setup ────────────────────────────────────────────────────────────────────
+
+let store: OrchestratorStore;
+
+beforeEach(() => {
+  store = new OrchestratorStore(':memory:');
+});
+
+afterEach(() => {
+  store.close();
+});
+
+// ─── Team CRUD ────────────────────────────────────────────────────────────────
+
+describe('OrchestratorStore — team CRUD', () => {
+  it('creates a team with a generated UUID', () => {
+    const team = store.createTeam(makeTeamInput());
+    expect(team.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  });
+
+  it('persists team fields correctly', () => {
+    const input = makeTeamInput({
+      name: 'my-team',
+      goal: 'Ship feature X',
+      topology: 'wave',
+      tags: ['urgent', 'frontend'],
+    });
+    const team = store.createTeam(input);
+    const fetched = store.getTeam(team.id);
+    expect(fetched).toBeDefined();
+    expect(fetched!.name).toBe('my-team');
+    expect(fetched!.goal).toBe('Ship feature X');
+    expect(fetched!.topology).toBe('wave');
+    expect(fetched!.tags).toEqual(['urgent', 'frontend']);
+  });
+
+  it('returns undefined for unknown team id', () => {
+    expect(store.getTeam('00000000-0000-0000-0000-000000000000')).toBeUndefined();
+  });
+
+  it('updates team and bumps updated_at', () => {
+    const team = store.createTeam(makeTeamInput());
+    const before = team.updatedAt;
+    const updated = store.updateTeam(team.id, { status: 'running' });
+    expect(updated!.status).toBe('running');
+    expect(updated!.updatedAt >= before).toBe(true);
+  });
+
+  it('transitionTeam sets completedAt on terminal status', () => {
+    const team = store.createTeam(makeTeamInput());
+    const done = store.transitionTeam(team.id, 'done');
+    expect(done!.status).toBe('done');
+    expect(done!.completedAt).toBeDefined();
+  });
+
+  it('queryTeams filters by status', () => {
+    store.createTeam(makeTeamInput({ name: 'team-1', status: 'planning' }));
+    store.createTeam(makeTeamInput({ name: 'team-2', status: 'running' }));
+    store.createTeam(makeTeamInput({ name: 'team-3', status: 'done' }));
+
+    const running = store.queryTeams({ status: 'running' });
+    expect(running.length).toBe(1);
+    expect(running[0].name).toBe('team-2');
+  });
+});
+
+// ─── Member CRUD ──────────────────────────────────────────────────────────────
+
+describe('OrchestratorStore — member CRUD', () => {
+  let teamId: string;
+
+  beforeEach(() => {
+    const team = store.createTeam(makeTeamInput());
+    teamId = team.id;
+  });
+
+  it('creates a member with generated UUID', () => {
+    const member = store.createMember(makeMemberInput(teamId));
+    expect(member.id).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  it('persists member fields correctly', () => {
+    const input = makeMemberInput(teamId, {
+      name: 'test-runner',
+      role: 'test_runner',
+      fileScope: ['tests/**'],
+      wave: 2,
+    });
+    const member = store.createMember(input);
+    const fetched = store.getMember(member.id);
+    expect(fetched!.name).toBe('test-runner');
+    expect(fetched!.role).toBe('test_runner');
+    expect(fetched!.fileScope).toEqual(['tests/**']);
+    expect(fetched!.wave).toBe(2);
+  });
+
+  it('getMemberByName finds member by team + name', () => {
+    store.createMember(makeMemberInput(teamId, { name: 'architect' }));
+    const found = store.getMemberByName(teamId, 'architect');
+    expect(found).toBeDefined();
+    expect(found!.name).toBe('architect');
+  });
+
+  it('queryMembers filters by status', () => {
+    store.createMember(makeMemberInput(teamId, { name: 'm1', status: 'idle' }));
+    store.createMember(makeMemberInput(teamId, { name: 'm2', status: 'working' }));
+    store.createMember(makeMemberInput(teamId, { name: 'm3', status: 'idle' }));
+
+    const idle = store.queryMembers({ teamId, status: 'idle' });
+    expect(idle.length).toBe(2);
+  });
+
+  it('transitionMember sets startedAt when transitioning to working', () => {
+    const member = store.createMember(makeMemberInput(teamId));
+    const working = store.transitionMember(member.id, 'working');
+    expect(working!.status).toBe('working');
+    expect(working!.startedAt).toBeDefined();
+  });
+
+  it('transitionMember sets completedAt on terminal status', () => {
+    const member = store.createMember(makeMemberInput(teamId));
+    const done = store.transitionMember(member.id, 'done');
+    expect(done!.completedAt).toBeDefined();
+  });
+});
+
+// ─── Shared tasks ─────────────────────────────────────────────────────────────
+
+describe('OrchestratorStore — shared tasks', () => {
+  let teamId: string;
+
+  beforeEach(() => {
+    teamId = store.createTeam(makeTeamInput()).id;
+  });
+
+  it('creates a shared task', () => {
+    const task = store.createSharedTask(makeTaskInput(teamId));
+    expect(task.id).toBeDefined();
+    expect(task.attemptCount).toBe(0);
+  });
+
+  it('querySharedTasks filters by status', () => {
+    store.createSharedTask(makeTaskInput(teamId, { title: 't1', status: 'pending' }));
+    store.createSharedTask(makeTaskInput(teamId, { title: 't2', status: 'completed' }));
+    store.createSharedTask(makeTaskInput(teamId, { title: 't3', status: 'pending' }));
+
+    const pending = store.querySharedTasks({ teamId, status: 'pending' });
+    expect(pending.length).toBe(2);
+  });
+
+  it('querySharedTasks readyOnly returns only unblocked tasks', () => {
+    const t1 = store.createSharedTask(makeTaskInput(teamId, { title: 't1', status: 'completed' }));
+    store.createSharedTask(makeTaskInput(teamId, { title: 't2', status: 'pending', blockedBy: [t1.id] }));
+    store.createSharedTask(makeTaskInput(teamId, { title: 't3', status: 'pending', blockedBy: ['ghost'] }));
+    store.createSharedTask(makeTaskInput(teamId, { title: 't4', status: 'pending', blockedBy: [] }));
+
+    const ready = store.querySharedTasks({ teamId, readyOnly: true });
+    // t2 should be ready (blocker completed), t3 blocked by ghost (not ready), t4 ready
+    const titles = ready.map((r) => store._rowToSharedTask(r).title);
+    expect(titles).toContain('t2');
+    expect(titles).toContain('t4');
+    expect(titles).not.toContain('t3');
+  });
+
+  it('transitionSharedTask increments attemptCount on in_progress', () => {
+    const task = store.createSharedTask(makeTaskInput(teamId));
+    store.transitionSharedTask(task.id, 'in_progress');
+    const updated = store.getSharedTask(task.id);
+    expect(updated!.attemptCount).toBe(1);
+  });
+
+  it('autoSkipBlockedTasks skips tasks whose blockers all failed', () => {
+    const failed = store.createSharedTask(makeTaskInput(teamId, { title: 'failed', status: 'failed' }));
+    store.createSharedTask(makeTaskInput(teamId, { title: 'blocked', status: 'blocked', blockedBy: [failed.id] }));
+
+    const skipped = store.autoSkipBlockedTasks(teamId);
+    expect(skipped).toBe(1);
+
+    const blockedTask = store.querySharedTasks({ teamId, status: 'skipped' });
+    expect(blockedTask.length).toBe(1);
+  });
+});
+
+// ─── Messages ─────────────────────────────────────────────────────────────────
+
+describe('OrchestratorStore — messages', () => {
+  let teamId: string;
+  let member1: TeamMember;
+  let member2: TeamMember;
+
+  beforeEach(() => {
+    teamId = store.createTeam(makeTeamInput()).id;
+    member1 = store.createMember(makeMemberInput(teamId, { name: 'm1' }));
+    member2 = store.createMember(makeMemberInput(teamId, { name: 'm2' }));
+  });
+
+  it('sends a direct message', () => {
+    const msg = store.sendMessage({
+      teamId,
+      fromMemberId: member1.id,
+      fromMemberName: member1.name,
+      toMemberId: member2.id,
+      toMemberName: member2.name,
+      channel: 'direct',
+      content: 'Hello',
+    });
+    expect(msg.id).toBeDefined();
+    expect(msg.read).toBe(false);
+  });
+
+  it('sends a broadcast message', () => {
+    const msg = store.sendMessage({
+      teamId,
+      fromMemberId: member1.id,
+      fromMemberName: member1.name,
+      channel: 'broadcast',
+      content: 'Team update',
+    });
+    expect(msg.channel).toBe('broadcast');
+  });
+
+  it('getMessages filters to target member', () => {
+    store.sendMessage({
+      teamId,
+      fromMemberId: member1.id,
+      fromMemberName: member1.name,
+      toMemberId: member2.id,
+      toMemberName: member2.name,
+      channel: 'direct',
+      content: 'Direct to m2',
+    });
+    store.sendMessage({
+      teamId,
+      fromMemberId: member1.id,
+      fromMemberName: member1.name,
+      channel: 'broadcast',
+      content: 'Broadcast',
+    });
+
+    const inbox = store.getMessages(teamId, { memberId: member2.id });
+    expect(inbox.length).toBe(2); // direct + broadcast
+  });
+
+  it('markMessagesRead updates read flag', () => {
+    const msg = store.sendMessage({
+      teamId,
+      fromMemberId: member1.id,
+      fromMemberName: member1.name,
+      toMemberId: member2.id,
+      toMemberName: member2.name,
+      channel: 'direct',
+      content: 'Test',
+    });
+
+    const marked = store.markMessagesRead([msg.id]);
+    expect(marked).toBe(1);
+
+    const unread = store.getMessages(teamId, { unreadOnly: true });
+    expect(unread.length).toBe(0);
+  });
+});
+
+// ─── File locks ───────────────────────────────────────────────────────────────
+
+describe('OrchestratorStore — file locks', () => {
+  let teamId: string;
+  let member: TeamMember;
+
+  beforeEach(() => {
+    teamId = store.createTeam(makeTeamInput()).id;
+    member = store.createMember(makeMemberInput(teamId, { name: 'locker' }));
+  });
+
+  it('acquires a file lock', () => {
+    const result = store.acquireFileLock(teamId, member.id, member.name, 'src/foo.ts');
+    expect('id' in result).toBe(true);
+    if ('id' in result) {
+      expect(result.status).toBe('held');
+    }
+  });
+
+  it('returns conflict when file already locked', () => {
+    const member2 = store.createMember(makeMemberInput(teamId, { name: 'm2' }));
+    store.acquireFileLock(teamId, member.id, member.name, 'src/foo.ts');
+    const result = store.acquireFileLock(teamId, member2.id, member2.name, 'src/foo.ts');
+
+    expect('conflict' in result).toBe(true);
+    if ('conflict' in result) {
+      expect(result.conflict.memberName).toBe(member.name);
+    }
+  });
+
+  it('releaseFileLock marks lock as released', () => {
+    const lock = store.acquireFileLock(teamId, member.id, member.name, 'src/foo.ts');
+    if ('id' in lock) {
+      const released = store.releaseFileLock(lock.id);
+      expect(released).toBe(true);
+
+      // Now can acquire again
+      const result2 = store.acquireFileLock(teamId, member.id, member.name, 'src/foo.ts');
+      expect('id' in result2).toBe(true);
+    }
+  });
+
+  it('releaseAllLocksForMember releases multiple locks', () => {
+    store.acquireFileLock(teamId, member.id, member.name, 'src/a.ts');
+    store.acquireFileLock(teamId, member.id, member.name, 'src/b.ts');
+
+    const count = store.releaseAllLocksForMember(teamId, member.id);
+    expect(count).toBe(2);
+  });
+
+  it('expireStaleFileLocks expires locks past TTL', () => {
+    // Acquire a lock with 0 minute TTL (expires immediately)
+    const lock = store.acquireFileLock(teamId, member.id, member.name, 'src/foo.ts', undefined, 0);
+
+    if ('id' in lock) {
+      // Force expiry by setting expires_at to past
+      store.db
+        .prepare("UPDATE orch_file_locks SET expires_at = datetime('now', '-1 minute') WHERE id = ?")
+        .run(lock.id);
+
+      const expired = store.expireStaleFileLocks(teamId);
+      expect(expired).toBe(1);
+
+      const active = store.getActiveFileLocks(teamId);
+      expect(active.length).toBe(0);
+    }
+  });
+});
+
+// ─── Results ──────────────────────────────────────────────────────────────────
+
+describe('OrchestratorStore — results', () => {
+  let teamId: string;
+  let member: TeamMember;
+
+  beforeEach(() => {
+    teamId = store.createTeam(makeTeamInput()).id;
+    member = store.createMember(makeMemberInput(teamId, { name: 'worker' }));
+  });
+
+  it('appends a result', () => {
+    const result = store.appendResult({
+      teamId,
+      memberId: member.id,
+      memberName: member.name,
+      memberRole: member.role,
+      content: 'Completed task X',
+      filesModified: ['src/feature.ts'],
+      tokensUsed: 1500,
+    });
+    expect(result.id).toBeDefined();
+    expect(result.producedAt).toBeDefined();
+  });
+
+  it('getResults returns results for a team', () => {
+    store.appendResult({
+      teamId,
+      memberId: member.id,
+      memberName: member.name,
+      memberRole: member.role,
+      content: 'Result 1',
+      filesModified: [],
+      tokensUsed: 100,
+    });
+    store.appendResult({
+      teamId,
+      memberId: member.id,
+      memberName: member.name,
+      memberRole: member.role,
+      content: 'Result 2',
+      filesModified: [],
+      tokensUsed: 200,
+    });
+
+    const results = store.getResults(teamId);
+    expect(results.length).toBe(2);
+  });
+
+  it('getResults filters by memberId', () => {
+    const m2 = store.createMember(makeMemberInput(teamId, { name: 'm2' }));
+    store.appendResult({
+      teamId,
+      memberId: member.id,
+      memberName: member.name,
+      memberRole: member.role,
+      content: 'From m1',
+      filesModified: [],
+      tokensUsed: 100,
+    });
+    store.appendResult({
+      teamId,
+      memberId: m2.id,
+      memberName: m2.name,
+      memberRole: m2.role,
+      content: 'From m2',
+      filesModified: [],
+      tokensUsed: 100,
+    });
+
+    const m1Results = store.getResults(teamId, member.id);
+    expect(m1Results.length).toBe(1);
+    expect(m1Results[0].member_name).toBe('worker');
+  });
+});
+
+// ─── Stats ────────────────────────────────────────────────────────────────────
+
+describe('OrchestratorStore — getStats', () => {
+  it('reports correct counts', () => {
+    const t1 = store.createTeam(makeTeamInput({ name: 't1', status: 'running' }));
+    const t2 = store.createTeam(makeTeamInput({ name: 't2', status: 'done' }));
+
+    store.createMember(makeMemberInput(t1.id, { name: 'm1', status: 'working' }));
+    store.createMember(makeMemberInput(t1.id, { name: 'm2', status: 'done' }));
+
+    store.sendMessage({
+      teamId: t1.id,
+      channel: 'broadcast',
+      content: 'Test',
+    });
+
+    const stats = store.getStats();
+    expect(stats.totalTeams).toBe(2);
+    expect(stats.activeTeams).toBe(1); // only t1 is running
+    expect(stats.totalMembers).toBe(2);
+    expect(stats.activeMembers).toBe(1); // only m1 is working
+    expect(stats.totalMessages).toBe(1);
+  });
+});
+src/tests/AgentRegistry.test.ts
+TypeScript
+
+/**
+ * AgentRegistry test suite
+ * Run with: bun test src/tests/AgentRegistry.test.ts
+ */
+
+import { describe, it, expect, beforeEach } from 'bun:test';
+import { AgentRegistry } from '../AgentRegistry.js';
+import type { AgentDefinition } from '../types/orchestrator.types.js';
+
+// ─── Fixtures ─────────────────────────────────────────────────────────────────
+
+function makeCustomDef(
+  overrides: Partial<AgentDefinition> = {},
+): AgentDefinition {
+  return {
+    name: 'custom-agent',
+    role: 'custom',
+    systemPromptSuffix: 'You are a custom agent.',
+    allowedTools: [],
+    deniedTools: [],
+    permissionProfile: 'standard',
+    capabilities: ['custom'],
+    description: 'A custom agent for testing',
+    supportsParallel: true,
+    ...overrides,
+  };
+}
+
+// ─── Setup ────────────────────────────────────────────────────────────────────
+
+let registry: AgentRegistry;
+
+beforeEach(() => {
+  registry = new AgentRegistry();
+});
+
+// ─── Built-in definitions ─────────────────────────────────────────────────────
+
+describe('AgentRegistry — built-in definitions', () => {
+  it('registers 8 built-in definitions on construction', () => {
+    const all = registry.listAll();
+    expect(all.length).toBe(8);
+  });
+
+  it('built-in definitions include expected roles', () => {
+    expect(registry.get('supervisor')).toBeDefined();
+    expect(registry.get('architect')).toBeDefined();
+    expect(registry.get('implementer')).toBeDefined();
+    expect(registry.get('test-runner')).toBeDefined();
+    expect(registry.get('security-reviewer')).toBeDefined();
+    expect(registry.get('doc-writer')).toBeDefined();
+    expect(registry.get('researcher')).toBeDefined();
+    expect(registry.get('reviewer')).toBeDefined();
+  });
+
+  it('getByRole finds first matching role', () => {
+    const def = registry.getByRole('architect');
+    expect(def).toBeDefined();
+    expect(def!.role).toBe('architect');
+  });
+
+  it('getAllByRole returns all matching definitions', () => {
+    const impls = registry.getAllByRole('implementer');
+    expect(impls.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+// ─── Registration ─────────────────────────────────────────────────────────────
+
+describe('AgentRegistry — custom registration', () => {
+  it('registers a custom definition', () => {
+    const def = makeCustomDef({ name: 'my-agent' });
+    registry.register(def);
+    expect(registry.has('my-agent')).toBe(true);
+    expect(registry.get('my-agent')).toEqual(def);
+  });
+
+  it('overwrites existing definition with same name', () => {
+    const def1 = makeCustomDef({ name: 'test', description: 'v1' });
+    const def2 = makeCustomDef({ name: 'test', description: 'v2' });
+    registry.register(def1);
+    registry.register(def2);
+
+    const fetched = registry.get('test');
+    expect(fetched!.description).toBe('v2');
+  });
+
+  it('throws on invalid definition (Zod validation)', () => {
+    const invalid = {
+      name: 'INVALID NAME WITH SPACES',
+      role: 'custom',
+      systemPromptSuffix: '',
+      capabilities: [],
+      description: '',
+    } as AgentDefinition;
+
+    expect(() => registry.register(invalid)).toThrow();
+  });
+
+  it('unregister removes a definition', () => {
+    const def = makeCustomDef({ name: 'temp' });
+    registry.register(def);
+    expect(registry.has('temp')).toBe(true);
+
+    const removed = registry.unregister('temp');
+    expect(removed).toBe(true);
+    expect(registry.has('temp')).toBe(false);
+  });
+
+  it('unregister returns false for non-existent name', () => {
+    expect(registry.unregister('ghost')).toBe(false);
+  });
+});
+
+// ─── Capability-based discovery ───────────────────────────────────────────────
+
+describe('AgentRegistry — findByCapabilities', () => {
+  it('finds definitions matching all required capabilities', () => {
+    const results = registry.findByCapabilities(['typescript', 'testing']);
+    // test-runner has both 'testing' and 'typescript'
+    expect(results.length).toBeGreaterThanOrEqual(1);
+    expect(results.some((d) => d.role === 'test_runner')).toBe(true);
+  });
+
+  it('returns empty array when no matches', () => {
+    const results = registry.findByCapabilities(['nonexistent-capability']);
+    expect(results.length).toBe(0);
+  });
+
+  it('bestMatch returns highest-scoring definition', () => {
+    const best = registry.bestMatch(['security', 'owasp']);
+    expect(best).toBeDefined();
+    expect(best!.role).toBe('security_reviewer');
+  });
+
+  it('bestMatch returns undefined when no match', () => {
+    const best = registry.bestMatch(['ghost-capability']);
+    expect(best).toBeUndefined();
+  });
+
+  it('getParallelSafe returns only definitions supporting parallel', () => {
+    const parallel = registry.getParallelSafe();
+    for (const def of parallel) {
+      expect(def.supportsParallel).toBe(true);
+    }
+  });
+});
+
+// ─── System prompt generation ─────────────────────────────────────────────────
+
+describe('AgentRegistry — buildSystemPromptSuffix', () => {
+  it('generates a prompt with team context', () => {
+    const suffix = registry.buildSystemPromptSuffix('implementer', {
+      teamName: 'test-team',
+      memberName: 'impl-1',
+      fileScope: ['src/**/*.ts'],
+      teamGoal: 'Build feature X',
+    });
+
+    expect(suffix).toContain('test-team');
+    expect(suffix).toContain('impl-1');
+    expect(suffix).toContain('src/**/*.ts');
+    expect(suffix).toContain('Build feature X');
+  });
+
+  it('includes role instructions from definition', () => {
+    const suffix = registry.buildSystemPromptSuffix('architect', {
+      teamName: 'team',
+      memberName: 'arch',
+      fileScope: [],
+    });
+
+    expect(suffix).toContain('architect');
+  });
+
+  it('includes custom prompt when provided', () => {
+    const suffix = registry.buildSystemPromptSuffix('implementer', {
+      teamName: 'team',
+      memberName: 'impl',
+      fileScope: [],
+      customPrompt: 'Focus on performance optimizations',
+    });
+
+    expect(suffix).toContain('Focus on performance optimizations');
+  });
+
+  it('includes communication instructions', () => {
+    const suffix = registry.buildSystemPromptSuffix('implementer', {
+      teamName: 'team',
+      memberName: 'impl',
+      fileScope: [],
+    });
+
+    expect(suffix).toContain('[MESSAGE: teammate-name]');
+    expect(suffix).toContain('[BROADCAST]');
+  });
+
+  it('warns about file scope restrictions', () => {
+    const suffix = registry.buildSystemPromptSuffix('implementer', {
+      teamName: 'team',
+      memberName: 'impl',
+      fileScope: ['src/auth/**'],
+    });
+
+    expect(suffix).toContain('file scope');
+    expect(suffix).toContain('src/auth/**');
+  });
+});
+
+// ─── Tool allowlist resolution ────────────────────────────────────────────────
+
+describe('AgentRegistry — resolveToolList', () => {
+  const availableTools = [
+    'read_file',
+    'write_file',
+    'run_shell',
+    'search_files',
+    'wiki_write',
+  ];
+
+  it('returns null when definition has no restrictions', () => {
+    const def = makeCustomDef({ name: 'open', allowedTools: [], deniedTools: [] });
+    registry.register(def);
+
+    const tools = registry.resolveToolList('open', availableTools);
+    expect(tools).toBeNull();
+  });
+
+  it('filters to allowedTools when set', () => {
+    const def = makeCustomDef({
+      name: 'restricted',
+      allowedTools: ['read_file', 'search_files'],
+      deniedTools: [],
+    });
+    registry.register(def);
+
+    const tools = registry.resolveToolList('restricted', availableTools);
+    expect(tools).toEqual(['read_file', 'search_files']);
+  });
+
+  it('removes deniedTools', () => {
+    const def = makeCustomDef({
+      name: 'no-shell',
+      allowedTools: [],
+      deniedTools: ['run_shell'],
+    });
+    registry.register(def);
+
+    const tools = registry.resolveToolList('no-shell', availableTools);
+    expect(tools).not.toContain('run_shell');
+    expect(tools).toContain('read_file');
+  });
+
+  it('allowedTools takes precedence over deniedTools', () => {
+    const def = makeCustomDef({
+      name: 'conflict',
+      allowedTools: ['read_file', 'write_file'],
+      deniedTools: ['write_file'],
+    });
+    registry.register(def);
+
+    const tools = registry.resolveToolList('conflict', availableTools);
+    // allowed is applied first, so only read_file and write_file
+    // then denied is removed
+    expect(tools).toEqual(['read_file']);
+  });
+});
+
+// ─── Markdown reporting ───────────────────────────────────────────────────────
+
+describe('AgentRegistry — toMarkdown', () => {
+  it('generates a Markdown table', () => {
+    const md = registry.toMarkdown();
+    expect(md).toContain('## Agent Registry');
+    expect(md).toContain('| Name | Role |');
+    expect(md).toContain('supervisor');
+    expect(md).toContain('architect');
+  });
+
+  it('includes all registered definitions', () => {
+    const custom = makeCustomDef({ name: 'my-custom' });
+    registry.register(custom);
+
+    const md = registry.toMarkdown();
+    expect(md).toContain('my-custom');
+  });
+});
+
+// ─── Retrieval helpers ────────────────────────────────────────────────────────
+
+describe('AgentRegistry — retrieval', () => {
+  it('listNames returns all registered names', () => {
+    const names = registry.listNames();
+    expect(names.length).toBe(8); // built-ins
+    expect(names).toContain('supervisor');
+  });
+
+  it('getOrFallback returns name if found', () => {
+    const def = registry.getOrFallback('architect', 'implementer');
+    expect(def!.name).toBe('architect');
+  });
+
+  it('getOrFallback falls back to role if name not found', () => {
+    const def = registry.getOrFallback('ghost', 'implementer');
+    expect(def!.role).toBe('implementer');
+  });
+});
+src/tests/AgentSpawner.test.ts
+TypeScript
+
+/**
+ * AgentSpawner test suite
+ * Run with: bun test src/tests/AgentSpawner.test.ts
+ */
+
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { OrchestratorStore } from '../OrchestratorStore.js';
+import { AgentRegistry } from '../AgentRegistry.js';
+import { AgentSpawner } from '../AgentSpawner.js';
+import type { CoreSession, SessionManagerLike, CoreSessionConfig } from '../AgentSpawner.js';
+import type { SpawnRequest } from '../types/orchestrator.types.js';
+
+// ─── Mock SessionManager ──────────────────────────────────────────────────────
+
+class MockSessionManager implements SessionManagerLike {
+  private sessions = new Map<string, CoreSession>();
+  private nextId = 1;
+
+  async create(config: CoreSessionConfig): Promise<CoreSession> {
+    const session: CoreSession = {
+      id: `session-${this.nextId++}`,
+      modelConfig: config.modelConfig,
+      workingDirectory: config.workingDirectory,
+      createdAt: new Date().toISOString(),
+    };
+    this.sessions.set(session.id, session);
+    return session;
+  }
+
+  async destroy(sessionId: string): Promise<void> {
+    this.sessions.delete(sessionId);
+  }
+
+  get(sessionId: string): CoreSession | undefined {
+    return this.sessions.get(sessionId);
+  }
+
+  reset(): void {
+    this.sessions.clear();
+    this.nextId = 1;
+  }
+}
+
+// ─── Setup ────────────────────────────────────────────────────────────────────
+
+let store: OrchestratorStore;
+let registry: AgentRegistry;
+let sessionManager: MockSessionManager;
+let spawner: AgentSpawner;
+let teamId: string;
+
+beforeEach(() => {
+  store = new OrchestratorStore(':memory:');
+  registry = new AgentRegistry();
+  sessionManager = new MockSessionManager();
+
+  spawner = new AgentSpawner(
+    store,
+    registry,
+    
