@@ -6928,3 +6928,2680 @@ export function makeWebFetchTool(): ToolDefinition<WebFetchInput> {
   };
 }
 
+
+
+Pass 11 — Part 2 (Complete Continuation)
+Packages: @locoworker/shared · @locoworker/tools-git · @locoworker/tools-search · @locoworker/tools-web (completion)
+Continuing: packages/tools-web (picking up from truncation)
+Everything above the truncation point already established the package.json, tsconfig.json, and the beginning of src/types.ts. We continue from the full type definitions and then build every module.
+
+packages/tools-web/src/types.ts (complete)
+TypeScript
+
+// packages/tools-web/src/types.ts
+
+import { z } from "zod";
+
+// ── Fetch tool ──────────────────────────────────────────────────────────────
+
+export const FetchUrlInputSchema = z.object({
+  url: z.string().url({ message: "Must be a valid URL" }),
+  method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]).default("GET"),
+  headers: z.record(z.string()).optional(),
+  body: z.string().optional(),
+  timeout_ms: z.number().int().min(1000).max(30_000).default(10_000),
+  max_response_bytes: z.number().int().min(1024).max(5_242_880).default(524_288), // 512 KB
+  follow_redirects: z.boolean().default(true),
+  extract_text: z.boolean().default(true).describe(
+    "If true, strip HTML tags and return readable text only"
+  ),
+  include_headers: z.boolean().default(false),
+});
+export type FetchUrlInput = z.infer<typeof FetchUrlInputSchema>;
+
+export interface FetchUrlResult {
+  url: string;
+  final_url: string;                 // after redirects
+  status: number;
+  status_text: string;
+  content_type: string;
+  headers?: Record<string, string>;
+  body: string;                       // text or extracted text
+  truncated: boolean;
+  bytes_received: number;
+  elapsed_ms: number;
+}
+
+// ── Screenshot / page render (headless — optional capability) ─────────────
+
+export const ScreenshotInputSchema = z.object({
+  url: z.string().url(),
+  width: z.number().int().min(320).max(3840).default(1280),
+  height: z.number().int().min(240).max(2160).default(800),
+  full_page: z.boolean().default(false),
+  timeout_ms: z.number().int().min(3000).max(60_000).default(20_000),
+  wait_for: z.enum(["load", "networkidle0", "networkidle2"]).default("networkidle2"),
+});
+export type ScreenshotInput = z.infer<typeof ScreenshotInputSchema>;
+
+export interface ScreenshotResult {
+  url: string;
+  width: number;
+  height: number;
+  format: "png";
+  base64: string;
+  elapsed_ms: number;
+}
+
+// ── HTML extract ──────────────────────────────────────────────────────────
+
+export const ExtractHtmlInputSchema = z.object({
+  html: z.string().min(1),
+  selectors: z.array(z.string()).min(1).max(20),
+  base_url: z.string().url().optional(),
+  extract_links: z.boolean().default(false),
+  extract_images: z.boolean().default(false),
+});
+export type ExtractHtmlInput = z.infer<typeof ExtractHtmlInputSchema>;
+
+export interface ExtractedElement {
+  selector: string;
+  count: number;
+  texts: string[];
+  links?: string[];
+  images?: string[];
+}
+
+export interface ExtractHtmlResult {
+  elements: ExtractedElement[];
+  links: string[];
+  images: string[];
+}
+
+// ── URL metadata ──────────────────────────────────────────────────────────
+
+export const UrlMetadataInputSchema = z.object({
+  url: z.string().url(),
+  timeout_ms: z.number().int().min(1000).max(15_000).default(8_000),
+});
+export type UrlMetadataInput = z.infer<typeof UrlMetadataInputSchema>;
+
+export interface UrlMetadata {
+  url: string;
+  final_url: string;
+  title?: string;
+  description?: string;
+  og_title?: string;
+  og_description?: string;
+  og_image?: string;
+  canonical?: string;
+  content_type: string;
+  status: number;
+  elapsed_ms: number;
+}
+
+// ── Blocked URL policy ────────────────────────────────────────────────────
+
+export interface WebToolsConfig {
+  allowedSchemes: string[];          // default: ["https", "http"]
+  blockedHostPatterns: RegExp[];     // deny-listed hosts/IPs
+  blockedIpRanges: string[];         // CIDR notation strings
+  userAgent: string;
+  maxConcurrentRequests: number;
+  requestTimeoutMs: number;
+}
+packages/tools-web/src/urlSafety.ts
+TypeScript
+
+// packages/tools-web/src/urlSafety.ts
+// Defense-in-depth: block SSRF, private IP ranges, dangerous schemes
+
+import { URL } from "url";
+
+const BLOCKED_SCHEMES = new Set(["file", "ftp", "data", "javascript", "vbscript"]);
+
+// RFC 1918 + loopback + link-local + APIPA ranges (SSRF protection)
+const PRIVATE_IP_PATTERNS = [
+  /^127\./,                          // loopback
+  /^10\./,                           // Class A private
+  /^172\.(1[6-9]|2\d|3[01])\./,     // Class B private
+  /^192\.168\./,                     // Class C private
+  /^169\.254\./,                     // link-local / APIPA
+  /^::1$/,                           // IPv6 loopback
+  /^fc00:/i,                         // IPv6 ULA
+  /^fe80:/i,                         // IPv6 link-local
+  /^0\.0\.0\.0$/,
+  /^localhost$/i,
+  /^metadata\.google\.internal$/i,   // GCE metadata
+  /^169\.254\.169\.254$/,            // AWS/GCE/Azure metadata endpoint
+];
+
+const BLOCKED_HOSTS = new Set([
+  "metadata.google.internal",
+  "169.254.169.254",
+  "instance-data",
+]);
+
+export class UrlSafetyError extends Error {
+  constructor(
+    message: string,
+    public readonly url: string,
+    public readonly reason: string
+  ) {
+    super(message);
+    this.name = "UrlSafetyError";
+  }
+}
+
+export function assertUrlSafe(rawUrl: string): URL {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new UrlSafetyError(`Invalid URL: ${rawUrl}`, rawUrl, "parse_error");
+  }
+
+  // Scheme check
+  const scheme = parsed.protocol.replace(":", "").toLowerCase();
+  if (BLOCKED_SCHEMES.has(scheme)) {
+    throw new UrlSafetyError(
+      `Blocked scheme "${scheme}" in URL`,
+      rawUrl,
+      "blocked_scheme"
+    );
+  }
+
+  // Hostname check
+  const host = parsed.hostname.toLowerCase();
+
+  if (BLOCKED_HOSTS.has(host)) {
+    throw new UrlSafetyError(
+      `Blocked host "${host}" (reserved/metadata)`,
+      rawUrl,
+      "blocked_host"
+    );
+  }
+
+  for (const pattern of PRIVATE_IP_PATTERNS) {
+    if (pattern.test(host)) {
+      throw new UrlSafetyError(
+        `Blocked private/loopback address "${host}" (SSRF protection)`,
+        rawUrl,
+        "private_ip"
+      );
+    }
+  }
+
+  // Credentials in URL are not allowed
+  if (parsed.username || parsed.password) {
+    throw new UrlSafetyError(
+      `Credentials in URL are not permitted`,
+      rawUrl,
+      "credentials_in_url"
+    );
+  }
+
+  return parsed;
+}
+
+export function sanitizeHeaders(headers: Record<string, string>): Record<string, string> {
+  const BLOCKED_HEADERS = new Set([
+    "authorization",
+    "cookie",
+    "x-api-key",
+    "x-auth-token",
+    "proxy-authorization",
+  ]);
+
+  const safe: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (!BLOCKED_HEADERS.has(key.toLowerCase())) {
+      safe[key] = value;
+    }
+  }
+  return safe;
+}
+packages/tools-web/src/htmlExtractor.ts
+TypeScript
+
+// packages/tools-web/src/htmlExtractor.ts
+// Lightweight HTML → readable text extraction (no full DOM dependency)
+
+const TAG_PATTERN = /<[^>]+>/g;
+const SCRIPT_STYLE_PATTERN = /<(script|style)[^>]*>[\s\S]*?<\/\1>/gi;
+const ENTITY_MAP: Record<string, string> = {
+  "&amp;": "&",
+  "&lt;": "<",
+  "&gt;": ">",
+  "&quot;": '"',
+  "&#39;": "'",
+  "&nbsp;": " ",
+  "&mdash;": "—",
+  "&ndash;": "–",
+  "&hellip;": "…",
+};
+
+export function htmlToText(html: string): string {
+  let text = html
+    .replace(SCRIPT_STYLE_PATTERN, " ")       // drop scripts/styles
+    .replace(TAG_PATTERN, " ")                 // strip remaining tags
+    .replace(/&[a-z#0-9]+;/gi, (entity) =>   // decode entities
+      ENTITY_MAP[entity] ?? entity
+    )
+    .replace(/[ \t]+/g, " ")                  // collapse whitespace
+    .replace(/\n{3,}/g, "\n\n")               // collapse blank lines
+    .trim();
+
+  return text;
+}
+
+export function extractMetaTags(html: string): Record<string, string> {
+  const meta: Record<string, string> = {};
+
+  // <title>
+  const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+  if (titleMatch) meta["title"] = titleMatch[1].trim();
+
+  // <meta name="..." content="...">
+  const metaPattern = /<meta\s+(?:[^>]*\s)?(?:name|property)="([^"]+)"[^>]*content="([^"]+)"/gi;
+  let m: RegExpExecArray | null;
+  while ((m = metaPattern.exec(html)) !== null) {
+    meta[m[1].toLowerCase()] = m[2];
+  }
+
+  // <link rel="canonical" href="...">
+  const canonicalMatch = html.match(/<link[^>]+rel="canonical"[^>]+href="([^"]+)"/i);
+  if (canonicalMatch) meta["canonical"] = canonicalMatch[1];
+
+  return meta;
+}
+
+export function extractLinks(html: string, baseUrl?: string): string[] {
+  const links: string[] = [];
+  const hrefPattern = /href="([^"#][^"]*)"/gi;
+  let m: RegExpExecArray | null;
+
+  while ((m = hrefPattern.exec(html)) !== null) {
+    const href = m[1].trim();
+    if (!href || href.startsWith("javascript:") || href.startsWith("mailto:")) {
+      continue;
+    }
+    try {
+      const resolved = baseUrl ? new URL(href, baseUrl).href : href;
+      links.push(resolved);
+    } catch {
+      // ignore unparseable
+    }
+  }
+
+  return [...new Set(links)].slice(0, 200);  // deduplicate, cap
+}
+
+export function extractImages(html: string, baseUrl?: string): string[] {
+  const images: string[] = [];
+  const srcPattern = /src="([^"]+\.(png|jpg|jpeg|gif|webp|svg))"/gi;
+  let m: RegExpExecArray | null;
+
+  while ((m = srcPattern.exec(html)) !== null) {
+    try {
+      const resolved = baseUrl ? new URL(m[1], baseUrl).href : m[1];
+      images.push(resolved);
+    } catch {
+      // ignore
+    }
+  }
+
+  return [...new Set(images)].slice(0, 50);
+}
+
+export function truncateToBytes(text: string, maxBytes: number): { text: string; truncated: boolean } {
+  const encoder = new TextEncoder();
+  const encoded = encoder.encode(text);
+  if (encoded.length <= maxBytes) return { text, truncated: false };
+
+  // Decode back only up to maxBytes (safe boundary)
+  const decoder = new TextDecoder("utf-8", { fatal: false });
+  const truncated = decoder.decode(encoded.slice(0, maxBytes));
+  return { text: truncated, truncated: true };
+}
+packages/tools-web/src/fetcher.ts
+TypeScript
+
+// packages/tools-web/src/fetcher.ts
+
+import { assertUrlSafe, sanitizeHeaders } from "./urlSafety.js";
+import { htmlToText, extractLinks, extractImages, truncateToBytes } from "./htmlExtractor.js";
+import type { FetchUrlInput, FetchUrlResult } from "./types.js";
+
+const DEFAULT_USER_AGENT =
+  "LocoWorker/1.0 (agentic-workspace; +https://github.com/locoworker)";
+
+export async function fetchUrl(input: FetchUrlInput): Promise<FetchUrlResult> {
+  const parsed = assertUrlSafe(input.url);   // throws UrlSafetyError if blocked
+
+  const safeHeaders = sanitizeHeaders(input.headers ?? {});
+  const requestHeaders: Record<string, string> = {
+    "User-Agent": DEFAULT_USER_AGENT,
+    Accept: "text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    ...safeHeaders,
+  };
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), input.timeout_ms);
+  const start = Date.now();
+
+  let response: Response;
+  try {
+    response = await fetch(parsed.href, {
+      method: input.method,
+      headers: requestHeaders,
+      body: input.body ?? undefined,
+      redirect: input.follow_redirects ? "follow" : "manual",
+      signal: controller.signal,
+    });
+  } catch (err: unknown) {
+    clearTimeout(timer);
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`Fetch failed for ${input.url}: ${msg}`);
+  } finally {
+    clearTimeout(timer);
+  }
+
+  const elapsed_ms = Date.now() - start;
+  const content_type = response.headers.get("content-type") ?? "application/octet-stream";
+  const final_url = response.url || input.url;
+
+  // Read body with size cap
+  const rawBytes = await response.arrayBuffer();
+  const bytes_received = rawBytes.byteLength;
+  const decoder = new TextDecoder("utf-8", { fatal: false });
+  let rawText = decoder.decode(rawBytes.slice(0, input.max_response_bytes));
+
+  // Strip HTML if requested and content is HTML
+  let body: string;
+  if (input.extract_text && content_type.includes("html")) {
+    body = htmlToText(rawText);
+  } else {
+    body = rawText;
+  }
+
+  const { text: finalBody, truncated } = truncateToBytes(body, input.max_response_bytes);
+
+  const result: FetchUrlResult = {
+    url: input.url,
+    final_url,
+    status: response.status,
+    status_text: response.statusText,
+    content_type,
+    body: finalBody,
+    truncated,
+    bytes_received,
+    elapsed_ms,
+  };
+
+  if (input.include_headers) {
+    const headers: Record<string, string> = {};
+    response.headers.forEach((value, key) => { headers[key] = value; });
+    result.headers = headers;
+  }
+
+  return result;
+}
+packages/tools-web/src/tools/fetchUrlTool.ts
+TypeScript
+
+// packages/tools-web/src/tools/fetchUrlTool.ts
+
+import type { ToolDefinition } from "@locoworker/core";
+import { FetchUrlInputSchema } from "../types.js";
+import { fetchUrl } from "../fetcher.js";
+import { UrlSafetyError } from "../urlSafety.js";
+
+export function makeFetchUrlTool(): ToolDefinition {
+  return {
+    name: "fetch_url",
+    description: [
+      "Fetch the content of a URL over HTTP/HTTPS.",
+      "Returns extracted readable text by default (HTML tags stripped).",
+      "Blocks private IP ranges, loopback addresses, and metadata endpoints (SSRF protection).",
+      "Set extract_text: false to get raw HTML/JSON.",
+      "Respects max_response_bytes (default 512 KB).",
+    ].join(" "),
+    schema: FetchUrlInputSchema,
+    requiredPermission: "NETWORK",
+    parallelSafe: true,
+    timeout: 35_000,
+    handler: async (input: unknown) => {
+      const parsed = FetchUrlInputSchema.parse(input);
+      try {
+        return await fetchUrl(parsed);
+      } catch (err) {
+        if (err instanceof UrlSafetyError) {
+          return {
+            error: true,
+            reason: err.reason,
+            message: err.message,
+            url: err.url,
+          };
+        }
+        throw err;
+      }
+    },
+  };
+}
+packages/tools-web/src/tools/extractHtmlTool.ts
+TypeScript
+
+// packages/tools-web/src/tools/extractHtmlTool.ts
+
+import type { ToolDefinition } from "@locoworker/core";
+import { ExtractHtmlInputSchema } from "../types.js";
+import { extractLinks, extractImages } from "../htmlExtractor.js";
+
+const SIMPLE_SELECTOR_RE = /^[a-zA-Z0-9._#\-\[\]="' :>+~*]+$/;
+
+function applySelector(html: string, selector: string): string[] {
+  // Lightweight extraction: match tag name and id/class hints
+  // Full CSS selector parsing requires a real DOM; here we extract text blocks
+  // that plausibly match. For production, inject cheerio or parse5.
+  const tagMatch = selector.match(/^([a-zA-Z][a-zA-Z0-9]*)(\.|#|$)/);
+  const tag = tagMatch ? tagMatch[1] : null;
+
+  const results: string[] = [];
+  if (!tag) return results;
+
+  const tagPattern = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, "gi");
+  let m: RegExpExecArray | null;
+  while ((m = tagPattern.exec(html)) !== null) {
+    const text = m[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    if (text) results.push(text);
+    if (results.length >= 50) break;   // cap per selector
+  }
+  return results;
+}
+
+export function makeExtractHtmlTool(): ToolDefinition {
+  return {
+    name: "extract_html",
+    description: [
+      "Extract structured content from raw HTML using CSS-like selectors.",
+      "Returns matched text, and optionally links and images.",
+      "Useful after fetch_url with extract_text: false to pull specific page sections.",
+    ].join(" "),
+    schema: ExtractHtmlInputSchema,
+    requiredPermission: "NETWORK",
+    parallelSafe: true,
+    timeout: 10_000,
+    handler: async (input: unknown) => {
+      const { ExtractHtmlInputSchema: s } = await import("../types.js");
+      const parsed = s.parse(input);
+
+      if (!parsed.selectors.every((sel) => SIMPLE_SELECTOR_RE.test(sel))) {
+        throw new Error("Selector contains unsafe characters");
+      }
+
+      const elements = parsed.selectors.map((selector) => ({
+        selector,
+        texts: applySelector(parsed.html, selector),
+        count: 0,
+      })).map((el) => ({ ...el, count: el.texts.length }));
+
+      const links = parsed.extract_links
+        ? extractLinks(parsed.html, parsed.base_url)
+        : [];
+      const images = parsed.extract_images
+        ? extractImages(parsed.html, parsed.base_url)
+        : [];
+
+      return { elements, links, images };
+    },
+  };
+}
+packages/tools-web/src/tools/urlMetadataTool.ts
+TypeScript
+
+// packages/tools-web/src/tools/urlMetadataTool.ts
+
+import type { ToolDefinition } from "@locoworker/core";
+import { UrlMetadataInputSchema } from "../types.js";
+import { assertUrlSafe } from "../urlSafety.js";
+import { extractMetaTags } from "../htmlExtractor.js";
+
+const DEFAULT_UA = "LocoWorker/1.0 (agentic-workspace)";
+
+export function makeUrlMetadataTool(): ToolDefinition {
+  return {
+    name: "url_metadata",
+    description: [
+      "Fetch just the metadata (title, description, OG tags, canonical URL) of a page",
+      "without returning the full body. Useful for link previews and research planning.",
+    ].join(" "),
+    schema: UrlMetadataInputSchema,
+    requiredPermission: "NETWORK",
+    parallelSafe: true,
+    timeout: 15_000,
+    handler: async (input: unknown) => {
+      const parsed = UrlMetadataInputSchema.parse(input);
+      const safeUrl = assertUrlSafe(parsed.url);
+
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), parsed.timeout_ms);
+      const start = Date.now();
+
+      let resp: Response;
+      try {
+        resp = await fetch(safeUrl.href, {
+          headers: { "User-Agent": DEFAULT_UA },
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+
+      const elapsed_ms = Date.now() - start;
+      const content_type = resp.headers.get("content-type") ?? "";
+
+      // Only read up to 64 KB for metadata extraction
+      const buf = await resp.arrayBuffer();
+      const html = new TextDecoder("utf-8", { fatal: false }).decode(
+        buf.slice(0, 65_536)
+      );
+
+      const meta = extractMetaTags(html);
+
+      return {
+        url: parsed.url,
+        final_url: resp.url || parsed.url,
+        title: meta["title"],
+        description: meta["description"] ?? meta["og:description"],
+        og_title: meta["og:title"],
+        og_description: meta["og:description"],
+        og_image: meta["og:image"],
+        canonical: meta["canonical"],
+        content_type,
+        status: resp.status,
+        elapsed_ms,
+      };
+    },
+  };
+}
+packages/tools-web/src/index.ts
+TypeScript
+
+// packages/tools-web/src/index.ts
+
+export * from "./types.js";
+export * from "./urlSafety.js";
+export * from "./htmlExtractor.js";
+export * from "./fetcher.js";
+export { makeFetchUrlTool } from "./tools/fetchUrlTool.js";
+export { makeExtractHtmlTool } from "./tools/extractHtmlTool.js";
+export { makeUrlMetadataTool } from "./tools/urlMetadataTool.js";
+
+import type { ToolRegistry } from "@locoworker/core";
+import { makeFetchUrlTool } from "./tools/fetchUrlTool.js";
+import { makeExtractHtmlTool } from "./tools/extractHtmlTool.js";
+import { makeUrlMetadataTool } from "./tools/urlMetadataTool.js";
+
+export function registerWebTools(registry: ToolRegistry): void {
+  registry.register(makeFetchUrlTool());
+  registry.register(makeExtractHtmlTool());
+  registry.register(makeUrlMetadataTool());
+}
+packages/tools-web/src/__tests__/urlSafety.test.ts
+TypeScript
+
+// packages/tools-web/src/__tests__/urlSafety.test.ts
+
+import { describe, it, expect } from "bun:test";
+import { assertUrlSafe, UrlSafetyError } from "../urlSafety.js";
+
+describe("assertUrlSafe", () => {
+  it("allows a normal HTTPS URL", () => {
+    expect(() => assertUrlSafe("https://example.com/page")).not.toThrow();
+  });
+
+  it("allows HTTP", () => {
+    expect(() => assertUrlSafe("http://example.com")).not.toThrow();
+  });
+
+  it("blocks file:// scheme", () => {
+    expect(() => assertUrlSafe("file:///etc/passwd")).toThrow(UrlSafetyError);
+  });
+
+  it("blocks javascript: scheme", () => {
+    expect(() => assertUrlSafe("javascript:alert(1)")).toThrow(UrlSafetyError);
+  });
+
+  it("blocks loopback 127.0.0.1", () => {
+    expect(() => assertUrlSafe("http://127.0.0.1/api")).toThrow(UrlSafetyError);
+  });
+
+  it("blocks private 192.168.x.x", () => {
+    expect(() => assertUrlSafe("http://192.168.1.1")).toThrow(UrlSafetyError);
+  });
+
+  it("blocks 10.x.x.x range", () => {
+    expect(() => assertUrlSafe("http://10.0.0.1/internal")).toThrow(UrlSafetyError);
+  });
+
+  it("blocks AWS metadata endpoint", () => {
+    expect(() => assertUrlSafe("http://169.254.169.254/latest/meta-data")).toThrow(UrlSafetyError);
+  });
+
+  it("blocks localhost", () => {
+    expect(() => assertUrlSafe("http://localhost:3000")).toThrow(UrlSafetyError);
+  });
+
+  it("blocks credentials in URL", () => {
+    expect(() => assertUrlSafe("https://user:pass@example.com")).toThrow(UrlSafetyError);
+  });
+
+  it("returns parsed URL on success", () => {
+    const u = assertUrlSafe("https://example.com/path?q=1");
+    expect(u.hostname).toBe("example.com");
+  });
+});
+packages/tools-web/src/__tests__/htmlExtractor.test.ts
+TypeScript
+
+// packages/tools-web/src/__tests__/htmlExtractor.test.ts
+
+import { describe, it, expect } from "bun:test";
+import { htmlToText, extractMetaTags, extractLinks, truncateToBytes } from "../htmlExtractor.js";
+
+const SAMPLE_HTML = `
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Test Page</title>
+  <meta name="description" content="A test page for LocoWorker">
+  <meta property="og:title" content="OG Title">
+  <link rel="canonical" href="https://example.com/test">
+  <style>body { color: red; }</style>
+  <script>console.log("hello")</script>
+</head>
+<body>
+  <h1>Hello World</h1>
+  <p>This is a paragraph with <a href="https://example.com">a link</a>.</p>
+  <p>Another paragraph &amp; some entities &lt;like this&gt;.</p>
+</body>
+</html>
+`;
+
+describe("htmlToText", () => {
+  it("removes tags and decodes entities", () => {
+    const text = htmlToText(SAMPLE_HTML);
+    expect(text).toContain("Hello World");
+    expect(text).toContain("& some entities <like this>");
+    expect(text).not.toContain("<h1>");
+    expect(text).not.toContain("console.log");  // script removed
+    expect(text).not.toContain("color: red");   // style removed
+  });
+});
+
+describe("extractMetaTags", () => {
+  it("extracts title", () => {
+    const meta = extractMetaTags(SAMPLE_HTML);
+    expect(meta["title"]).toBe("Test Page");
+  });
+
+  it("extracts description", () => {
+    const meta = extractMetaTags(SAMPLE_HTML);
+    expect(meta["description"]).toBe("A test page for LocoWorker");
+  });
+
+  it("extracts og:title", () => {
+    const meta = extractMetaTags(SAMPLE_HTML);
+    expect(meta["og:title"]).toBe("OG Title");
+  });
+
+  it("extracts canonical link", () => {
+    const meta = extractMetaTags(SAMPLE_HTML);
+    expect(meta["canonical"]).toBe("https://example.com/test");
+  });
+});
+
+describe("extractLinks", () => {
+  it("extracts href links", () => {
+    const links = extractLinks(SAMPLE_HTML, "https://example.com");
+    expect(links).toContain("https://example.com/");
+  });
+
+  it("deduplicates", () => {
+    const html = `<a href="/page">1</a><a href="/page">2</a>`;
+    const links = extractLinks(html, "https://example.com");
+    expect(links.filter((l) => l.includes("/page")).length).toBe(1);
+  });
+});
+
+describe("truncateToBytes", () => {
+  it("returns text unchanged if under limit", () => {
+    const { text, truncated } = truncateToBytes("hello", 100);
+    expect(text).toBe("hello");
+    expect(truncated).toBe(false);
+  });
+
+  it("truncates long text", () => {
+    const long = "a".repeat(1000);
+    const { text, truncated } = truncateToBytes(long, 100);
+    expect(text.length).toBeLessThanOrEqual(100);
+    expect(truncated).toBe(true);
+  });
+});
+packages/shared — @locoworker/shared
+This package is referenced in devDependencies across almost every other package (Pass 2–11) but never fully generated in the repo. It is the lowest-level utility layer.
+
+packages/shared/package.json
+JSON
+
+{
+  "name": "@locoworker/shared",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc --build",
+    "dev": "tsc --build --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "clean": "rm -rf dist tsconfig.tsbuildinfo"
+  },
+  "dependencies": {
+    "zod": "^3.23.0",
+    "chalk": "^5.3.0",
+    "ms": "^2.1.3"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/ms": "^0.7.34",
+    "@types/node": "^20.12.0"
+  }
+}
+packages/shared/tsconfig.json
+JSON
+
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "composite": true,
+    "declarationMap": true
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}
+packages/shared/src/constants.ts
+TypeScript
+
+// packages/shared/src/constants.ts
+
+export const LOCOWORKER_VERSION = "1.0.0";
+export const MEMORY_FILE_NAME = "MEMORY.md";
+export const CLAUDE_FILE_NAME = "CLAUDE.md";
+export const WIKI_DIR_NAME = ".locoworker/wiki";
+export const GRAPH_DB_NAME = ".locoworker/graph.db";
+export const KAIROS_DB_NAME = ".locoworker/kairos.db";
+export const AUTORESEARCH_DB_NAME = ".locoworker/research.db";
+export const MIROFISH_DB_NAME = ".locoworker/sim.db";
+export const MEMORY_INDEX_FILE = ".locoworker/memory-index.json";
+
+// Token budgets
+export const DEFAULT_MAX_TOKENS_BEFORE_COMPACTION = 180_000;
+export const DEFAULT_RESERVED_OUTPUT_TOKENS = 16_000;
+export const DEFAULT_RESERVED_TOOL_TOKENS = 8_000;
+
+// Cost caps (USD)
+export const DEFAULT_SESSION_COST_CAP_USD = 5.0;
+export const DEFAULT_DAILY_COST_CAP_USD = 20.0;
+
+// Tool limits
+export const MAX_BASH_OUTPUT_BYTES = 102_400;    // 100 KB
+export const MAX_BASH_OUTPUT_LINES = 500;
+export const MAX_READ_FILE_BYTES = 1_048_576;    // 1 MB
+export const MAX_FETCH_RESPONSE_BYTES = 524_288; // 512 KB
+
+// Timeouts (ms)
+export const DEFAULT_TOOL_TIMEOUT_MS = 30_000;
+export const MAX_BASH_TIMEOUT_MS = 300_000;
+export const DEFAULT_WEB_FETCH_TIMEOUT_MS = 10_000;
+packages/shared/src/logger.ts
+TypeScript
+
+// packages/shared/src/logger.ts
+// Lightweight structured logger used across all packages
+
+import chalk from "chalk";
+
+export type LogLevel = "debug" | "info" | "warn" | "error" | "silent";
+
+const LEVELS: Record<LogLevel, number> = {
+  debug: 0,
+  info: 1,
+  warn: 2,
+  error: 3,
+  silent: 99,
+};
+
+const COLORS: Record<LogLevel, (s: string) => string> = {
+  debug: chalk.gray,
+  info: chalk.cyan,
+  warn: chalk.yellow,
+  error: chalk.red,
+  silent: (s) => s,
+};
+
+export interface LogEntry {
+  level: LogLevel;
+  pkg: string;
+  message: string;
+  data?: unknown;
+  ts: number;
+}
+
+export type LogSink = (entry: LogEntry) => void;
+
+let currentLevel: LogLevel = (process.env.LOG_LEVEL as LogLevel) ?? "info";
+const sinks: LogSink[] = [];
+
+export function setLogLevel(level: LogLevel): void {
+  currentLevel = level;
+}
+
+export function addLogSink(sink: LogSink): void {
+  sinks.push(sink);
+}
+
+function emit(level: LogLevel, pkg: string, message: string, data?: unknown): void {
+  if (LEVELS[level] < LEVELS[currentLevel]) return;
+
+  const entry: LogEntry = { level, pkg, message, data, ts: Date.now() };
+
+  // Default console output
+  const prefix = COLORS[level](`[${level.toUpperCase()}]`);
+  const pkgLabel = chalk.dim(`[${pkg}]`);
+  const dataStr = data !== undefined ? ` ${JSON.stringify(data)}` : "";
+  // eslint-disable-next-line no-console
+  console.log(`${prefix} ${pkgLabel} ${message}${dataStr}`);
+
+  // Forward to registered sinks
+  for (const sink of sinks) sink(entry);
+}
+
+export function createLogger(pkg: string) {
+  return {
+    debug: (msg: string, data?: unknown) => emit("debug", pkg, msg, data),
+    info: (msg: string, data?: unknown) => emit("info", pkg, msg, data),
+    warn: (msg: string, data?: unknown) => emit("warn", pkg, msg, data),
+    error: (msg: string, data?: unknown) => emit("error", pkg, msg, data),
+  };
+}
+packages/shared/src/result.ts
+TypeScript
+
+// packages/shared/src/result.ts
+// Functional Result<T, E> type used across all packages
+
+export type Ok<T> = { ok: true; value: T };
+export type Err<E> = { ok: false; error: E };
+export type Result<T, E = Error> = Ok<T> | Err<E>;
+
+export function ok<T>(value: T): Ok<T> {
+  return { ok: true, value };
+}
+
+export function err<E>(error: E): Err<E> {
+  return { ok: false, error };
+}
+
+export function isOk<T, E>(result: Result<T, E>): result is Ok<T> {
+  return result.ok === true;
+}
+
+export function isErr<T, E>(result: Result<T, E>): result is Err<E> {
+  return result.ok === false;
+}
+
+export function unwrap<T, E>(result: Result<T, E>): T {
+  if (!result.ok) throw result.error;
+  return result.value;
+}
+
+export function mapResult<T, U, E>(
+  result: Result<T, E>,
+  fn: (value: T) => U
+): Result<U, E> {
+  if (!result.ok) return result;
+  return ok(fn(result.value));
+}
+
+export async function tryAsync<T>(
+  fn: () => Promise<T>
+): Promise<Result<T, Error>> {
+  try {
+    return ok(await fn());
+  } catch (e) {
+    return err(e instanceof Error ? e : new Error(String(e)));
+  }
+}
+packages/shared/src/tokens.ts
+TypeScript
+
+// packages/shared/src/tokens.ts
+// Rough token counting utilities (no tiktoken dependency in shared)
+
+/**
+ * Fast heuristic token estimator.
+ * Calibrated to approximate GPT-4 / Claude tokenization:
+ *   ~4 chars per token for English prose.
+ *   Code tends to be slightly more token-dense (~3.5 chars/token).
+ */
+export function estimateTokens(text: string): number {
+  if (!text) return 0;
+  // count word-like chunks + punctuation
+  const wordCount = text.split(/\s+/).length;
+  const charCount = text.length;
+  // Weighted average: 75% word-based (1.3 tokens/word), 25% char-based
+  const wordEstimate = wordCount * 1.3;
+  const charEstimate = charCount / 4.0;
+  return Math.ceil(0.75 * wordEstimate + 0.25 * charEstimate);
+}
+
+export function estimateTokensForMessages(
+  messages: Array<{ role: string; content: string }>
+): number {
+  // Per-message overhead (role + structural tokens)
+  const PER_MESSAGE_OVERHEAD = 4;
+  return messages.reduce(
+    (sum, msg) => sum + estimateTokens(msg.content) + PER_MESSAGE_OVERHEAD,
+    3   // reply primer
+  );
+}
+
+export function formatTokenCount(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  return String(n);
+}
+
+export interface TokenBudget {
+  contextWindow: number;
+  reservedOutput: number;
+  reservedTools: number;
+}
+
+export function availableInputTokens(budget: TokenBudget): number {
+  return budget.contextWindow - budget.reservedOutput - budget.reservedTools;
+}
+
+export function compactionThreshold(budget: TokenBudget, ratio = 0.85): number {
+  return Math.floor(availableInputTokens(budget) * ratio);
+}
+packages/shared/src/time.ts
+TypeScript
+
+// packages/shared/src/time.ts
+
+import ms from "ms";
+
+export function formatDuration(ms_val: number): string {
+  if (ms_val < 1000) return `${ms_val}ms`;
+  return ms(ms_val, { long: false });
+}
+
+export function sleep(ms_val: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms_val));
+}
+
+export function now(): number {
+  return Date.now();
+}
+
+export function isoNow(): string {
+  return new Date().toISOString();
+}
+
+export function msFromNow(delta: number): number {
+  return Date.now() + delta;
+}
+
+export function isExpired(timestamp: number): boolean {
+  return Date.now() > timestamp;
+}
+
+export function secondsSince(timestamp: number): number {
+  return Math.floor((Date.now() - timestamp) / 1000);
+}
+packages/shared/src/format.ts
+TypeScript
+
+// packages/shared/src/format.ts
+
+/** Truncate a string to `maxLength` characters, appending ellipsis if needed. */
+export function truncate(str: string, maxLength: number, ellipsis = "…"): string {
+  if (str.length <= maxLength) return str;
+  return str.slice(0, maxLength - ellipsis.length) + ellipsis;
+}
+
+/** Slugify a string: lowercase, replace spaces/special chars with dashes. */
+export function slugify(str: string): string {
+  return str
+    .toLowerCase()
+    .replace(/[^\w\s-]/g, "")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
+/** Format bytes into a human-readable string. */
+export function formatBytes(bytes: number, decimals = 2): string {
+  if (bytes === 0) return "0 B";
+  const k = 1024;
+  const sizes = ["B", "KB", "MB", "GB", "TB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return `${parseFloat((bytes / Math.pow(k, i)).toFixed(decimals))} ${sizes[i]}`;
+}
+
+/** Indent every line of a multi-line string. */
+export function indent(str: string, spaces = 2): string {
+  const pad = " ".repeat(spaces);
+  return str.split("\n").map((line) => pad + line).join("\n");
+}
+
+/** Format a cost in USD. */
+export function formatCost(usd: number): string {
+  if (usd < 0.01) return `$${(usd * 100).toFixed(3)}¢`;
+  return `$${usd.toFixed(4)}`;
+}
+
+/** Wrap text at a given column width. */
+export function wordWrap(str: string, width = 80): string {
+  const words = str.split(" ");
+  const lines: string[] = [];
+  let current = "";
+
+  for (const word of words) {
+    if (current.length + word.length + 1 > width) {
+      if (current) lines.push(current);
+      current = word;
+    } else {
+      current = current ? `${current} ${word}` : word;
+    }
+  }
+  if (current) lines.push(current);
+  return lines.join("\n");
+}
+packages/shared/src/env.ts
+TypeScript
+
+// packages/shared/src/env.ts
+// Safe environment variable accessors (used across all packages)
+
+export function requireEnv(key: string): string {
+  const val = process.env[key];
+  if (!val) throw new Error(`Required env var "${key}" is not set`);
+  return val;
+}
+
+export function getEnv(key: string, fallback: string): string {
+  return process.env[key] ?? fallback;
+}
+
+export function getEnvBool(key: string, fallback = false): boolean {
+  const val = process.env[key];
+  if (!val) return fallback;
+  return ["1", "true", "yes", "on"].includes(val.toLowerCase());
+}
+
+export function getEnvInt(key: string, fallback: number): number {
+  const val = process.env[key];
+  if (!val) return fallback;
+  const n = parseInt(val, 10);
+  return isNaN(n) ? fallback : n;
+}
+
+export function getEnvFloat(key: string, fallback: number): number {
+  const val = process.env[key];
+  if (!val) return fallback;
+  const n = parseFloat(val);
+  return isNaN(n) ? fallback : n;
+}
+
+export function isDevelopment(): boolean {
+  return getEnv("NODE_ENV", "development") === "development";
+}
+
+export function isProduction(): boolean {
+  return process.env.NODE_ENV === "production";
+}
+
+export function isTest(): boolean {
+  return process.env.NODE_ENV === "test" || !!process.env.BUN_ENV?.includes("test");
+}
+packages/shared/src/index.ts
+TypeScript
+
+// packages/shared/src/index.ts
+
+export * from "./constants.js";
+export * from "./logger.js";
+export * from "./result.js";
+export * from "./tokens.js";
+export * from "./time.js";
+export * from "./format.js";
+export * from "./env.js";
+packages/shared/src/__tests__/shared.test.ts
+TypeScript
+
+// packages/shared/src/__tests__/shared.test.ts
+
+import { describe, it, expect } from "bun:test";
+import { slugify, truncate, formatBytes, formatCost } from "../format.js";
+import { estimateTokens, formatTokenCount, compactionThreshold } from "../tokens.js";
+import { ok, err, isOk, isErr, unwrap, tryAsync } from "../result.js";
+import { sleep } from "../time.js";
+
+describe("format", () => {
+  it("slugifies correctly", () => {
+    expect(slugify("Hello World!")).toBe("hello-world");
+    expect(slugify("  multiple   spaces  ")).toBe("multiple-spaces");
+  });
+
+  it("truncates correctly", () => {
+    expect(truncate("short", 10)).toBe("short");
+    expect(truncate("a very long string", 10)).toBe("a very lo…");
+  });
+
+  it("formats bytes", () => {
+    expect(formatBytes(0)).toBe("0 B");
+    expect(formatBytes(1024)).toBe("1 KB");
+    expect(formatBytes(1_048_576)).toBe("1 MB");
+  });
+
+  it("formats cost", () => {
+    expect(formatCost(0.001)).toContain("¢");
+    expect(formatCost(1.5)).toBe("$1.5000");
+  });
+});
+
+describe("tokens", () => {
+  it("estimates tokens for non-empty text", () => {
+    const n = estimateTokens("Hello, world! This is a test sentence.");
+    expect(n).toBeGreaterThan(0);
+  });
+
+  it("returns 0 for empty string", () => {
+    expect(estimateTokens("")).toBe(0);
+  });
+
+  it("formats token counts", () => {
+    expect(formatTokenCount(500)).toBe("500");
+    expect(formatTokenCount(1500)).toBe("1.5K");
+    expect(formatTokenCount(1_500_000)).toBe("1.5M");
+  });
+
+  it("computes compaction threshold", () => {
+    const budget = { contextWindow: 200_000, reservedOutput: 16_000, reservedTools: 8_000 };
+    const threshold = compactionThreshold(budget, 0.85);
+    expect(threshold).toBe(Math.floor((200_000 - 16_000 - 8_000) * 0.85));
+  });
+});
+
+describe("Result", () => {
+  it("ok wraps a value", () => {
+    const r = ok(42);
+    expect(isOk(r)).toBe(true);
+    expect(unwrap(r)).toBe(42);
+  });
+
+  it("err wraps an error", () => {
+    const r = err(new Error("fail"));
+    expect(isErr(r)).toBe(true);
+  });
+
+  it("tryAsync captures thrown errors", async () => {
+    const r = await tryAsync(async () => { throw new Error("boom"); });
+    expect(isErr(r)).toBe(true);
+  });
+
+  it("tryAsync returns ok on success", async () => {
+    const r = await tryAsync(async () => 99);
+    expect(isOk(r)).toBe(true);
+    expect(unwrap(r)).toBe(99);
+  });
+});
+
+describe("sleep", () => {
+  it("resolves after delay", async () => {
+    const start = Date.now();
+    await sleep(20);
+    expect(Date.now() - start).toBeGreaterThanOrEqual(18);
+  });
+});
+packages/tools-git — @locoworker/tools-git
+packages/tools-git/package.json
+JSON
+
+{
+  "name": "@locoworker/tools-git",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc --build",
+    "dev": "tsc --build --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "clean": "rm -rf dist tsconfig.tsbuildinfo"
+  },
+  "dependencies": {
+    "zod": "^3.23.0"
+  },
+  "peerDependencies": {
+    "@locoworker/core": "workspace:*",
+    "@locoworker/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "@locoworker/core": "workspace:*",
+    "@locoworker/shared": "workspace:*",
+    "typescript": "^5.4.0",
+    "@types/node": "^20.12.0"
+  }
+}
+packages/tools-git/tsconfig.json
+JSON
+
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "composite": true,
+    "declarationMap": true
+  },
+  "include": ["src/**/*"],
+  "references": [
+    { "path": "../core" },
+    { "path": "../shared" }
+  ],
+  "exclude": ["node_modules", "dist"]
+}
+packages/tools-git/src/types.ts
+TypeScript
+
+// packages/tools-git/src/types.ts
+
+import { z } from "zod";
+
+// ── git_status ────────────────────────────────────────────────────────────
+
+export const GitStatusInputSchema = z.object({
+  path: z.string().optional().default("."),
+  short: z.boolean().default(true),
+});
+export type GitStatusInput = z.infer<typeof GitStatusInputSchema>;
+
+export interface GitFileStatus {
+  path: string;
+  index: string;     // staged indicator
+  workdir: string;   // unstaged indicator
+  renamed_from?: string;
+}
+
+export interface GitStatusResult {
+  branch: string;
+  upstream?: string;
+  ahead: number;
+  behind: number;
+  staged: GitFileStatus[];
+  unstaged: GitFileStatus[];
+  untracked: string[];
+  conflicted: string[];
+  is_clean: boolean;
+}
+
+// ── git_diff ──────────────────────────────────────────────────────────────
+
+export const GitDiffInputSchema = z.object({
+  path: z.string().optional().default("."),
+  staged: z.boolean().default(false),
+  file: z.string().optional(),
+  from_ref: z.string().optional(),
+  to_ref: z.string().optional(),
+  context_lines: z.number().int().min(0).max(20).default(3),
+  max_bytes: z.number().int().min(1024).max(524_288).default(131_072),
+});
+export type GitDiffInput = z.infer<typeof GitDiffInputSchema>;
+
+export interface GitDiffResult {
+  diff: string;
+  truncated: boolean;
+  bytes: number;
+  files_changed: number;
+}
+
+// ── git_log ───────────────────────────────────────────────────────────────
+
+export const GitLogInputSchema = z.object({
+  path: z.string().optional().default("."),
+  limit: z.number().int().min(1).max(200).default(20),
+  file: z.string().optional(),
+  from_ref: z.string().optional(),
+  to_ref: z.string().optional(),
+  author: z.string().optional(),
+  since: z.string().optional(),  // e.g. "2 weeks ago"
+  grep: z.string().optional(),
+  oneline: z.boolean().default(false),
+});
+export type GitLogInput = z.infer<typeof GitLogInputSchema>;
+
+export interface GitCommit {
+  hash: string;
+  short_hash: string;
+  author_name: string;
+  author_email: string;
+  date: string;
+  subject: string;
+  body?: string;
+}
+
+export interface GitLogResult {
+  commits: GitCommit[];
+  total_returned: number;
+}
+
+// ── git_show ──────────────────────────────────────────────────────────────
+
+export const GitShowInputSchema = z.object({
+  path: z.string().optional().default("."),
+  ref: z.string().min(1),
+  file: z.string().optional(),
+  max_bytes: z.number().int().min(1024).max(524_288).default(131_072),
+});
+export type GitShowInput = z.infer<typeof GitShowInputSchema>;
+
+export interface GitShowResult {
+  ref: string;
+  content: string;
+  truncated: boolean;
+}
+
+// ── git_branch ────────────────────────────────────────────────────────────
+
+export const GitBranchInputSchema = z.object({
+  path: z.string().optional().default("."),
+  all: z.boolean().default(false),
+  remotes: z.boolean().default(false),
+});
+export type GitBranchInput = z.infer<typeof GitBranchInputSchema>;
+
+export interface GitBranchResult {
+  current: string;
+  branches: Array<{
+    name: string;
+    is_current: boolean;
+    is_remote: boolean;
+    upstream?: string;
+  }>;
+}
+
+// ── git_stash_list ────────────────────────────────────────────────────────
+
+export const GitStashListInputSchema = z.object({
+  path: z.string().optional().default("."),
+});
+export type GitStashListInput = z.infer<typeof GitStashListInputSchema>;
+
+export interface GitStashEntry {
+  index: number;
+  ref: string;
+  description: string;
+}
+
+export interface GitStashListResult {
+  stashes: GitStashEntry[];
+}
+packages/tools-git/src/gitRunner.ts
+TypeScript
+
+// packages/tools-git/src/gitRunner.ts
+// Safe git command runner — uses structured argv (no shell interpolation)
+
+import { spawnSync } from "child_process";
+import { resolve } from "path";
+import { existsSync } from "fs";
+
+export class GitError extends Error {
+  constructor(
+    message: string,
+    public readonly args: string[],
+    public readonly stderr: string,
+    public readonly code: number
+  ) {
+    super(message);
+    this.name = "GitError";
+  }
+}
+
+export class NotAGitRepoError extends Error {
+  constructor(dir: string) {
+    super(`Not a git repository: ${dir}`);
+    this.name = "NotAGitRepoError";
+  }
+}
+
+function assertGitRepo(cwd: string): void {
+  const gitDir = resolve(cwd, ".git");
+  // .git could be a file (worktrees) or directory
+  if (!existsSync(gitDir)) {
+    // Try going up one level (submodule case) but never more than 5 levels
+    throw new NotAGitRepoError(cwd);
+  }
+}
+
+export interface GitRunOptions {
+  cwd: string;
+  timeout?: number;
+  maxBuffer?: number;
+}
+
+export function runGit(args: string[], opts: GitRunOptions): string {
+  const { cwd, timeout = 15_000, maxBuffer = 524_288 } = opts;
+
+  assertGitRepo(cwd);
+
+  // Validate no shell-special args to prevent injection
+  for (const arg of args) {
+    if (/[;&|`$<>]/.test(arg)) {
+      throw new GitError(
+        `Potentially unsafe git argument: "${arg}"`,
+        args,
+        "",
+        -1
+      );
+    }
+  }
+
+  const result = spawnSync("git", args, {
+    cwd,
+    encoding: "utf-8",
+    timeout,
+    maxBuffer,
+    env: {
+      ...process.env,
+      // Force consistent output regardless of user git config
+      GIT_TERMINAL_PROMPT: "0",
+      GIT_PAGER: "cat",
+      GIT_CONFIG_NOSYSTEM: "1",
+      LANG: "en_US.UTF-8",
+    },
+  });
+
+  if (result.error) {
+    throw new GitError(
+      `git ${args[0]} failed: ${result.error.message}`,
+      args,
+      "",
+      -1
+    );
+  }
+
+  if (result.status !== 0) {
+    throw new GitError(
+      `git ${args[0]} exited with code ${result.status}: ${result.stderr?.trim()}`,
+      args,
+      result.stderr ?? "",
+      result.status ?? 1
+    );
+  }
+
+  return result.stdout ?? "";
+}
+
+export function tryRunGit(args: string[], opts: GitRunOptions): string | null {
+  try {
+    return runGit(args, opts);
+  } catch {
+    return null;
+  }
+}
+packages/tools-git/src/parsers.ts
+TypeScript
+
+// packages/tools-git/src/parsers.ts
+// Parse raw git output into structured types
+
+import type {
+  GitStatusResult,
+  GitFileStatus,
+  GitCommit,
+  GitLogResult,
+  GitBranchResult,
+  GitStashListResult,
+} from "./types.js";
+
+// ── Status ────────────────────────────────────────────────────────────────
+
+const XY_TO_STATE: Record<string, string> = {
+  " M": "modified",
+  " D": "deleted",
+  " A": "added",
+  "M ": "staged-modified",
+  "A ": "staged-added",
+  "D ": "staged-deleted",
+  "R ": "staged-renamed",
+  "??": "untracked",
+  "UU": "conflicted",
+};
+
+export function parseStatus(raw: string, branchRaw: string): GitStatusResult {
+  const staged: GitFileStatus[] = [];
+  const unstaged: GitFileStatus[] = [];
+  const untracked: string[] = [];
+  const conflicted: string[] = [];
+
+  for (const line of raw.split("\n").filter(Boolean)) {
+    const xy = line.slice(0, 2);
+    const file = line.slice(3).trim();
+
+    if (xy === "??") {
+      untracked.push(file);
+    } else if (xy === "UU" || xy === "AA" || xy === "DD") {
+      conflicted.push(file);
+    } else {
+      const index = xy[0];
+      const workdir = xy[1];
+
+      if (index !== " " && index !== "?") {
+        staged.push({ path: file, index, workdir });
+      }
+      if (workdir !== " " && workdir !== "?") {
+        unstaged.push({ path: file, index, workdir });
+      }
+    }
+  }
+
+  // Parse branch info from `git status --branch --porcelain=v1`
+  // e.g. "## main...origin/main [ahead 1, behind 2]"
+  let branch = "HEAD";
+  let upstream: string | undefined;
+  let ahead = 0;
+  let behind = 0;
+
+  const branchMatch = branchRaw.match(/^## (.+?)(?:\.\.\.(.+?))?(?:\s\[(.+?)\])?$/);
+  if (branchMatch) {
+    branch = branchMatch[1] ?? "HEAD";
+    upstream = branchMatch[2];
+    const tracking = branchMatch[3] ?? "";
+    const aheadMatch = tracking.match(/ahead (\d+)/);
+    const behindMatch = tracking.match(/behind (\d+)/);
+    ahead = aheadMatch ? parseInt(aheadMatch[1], 10) : 0;
+    behind = behindMatch ? parseInt(behindMatch[1], 10) : 0;
+  }
+
+  return {
+    branch,
+    upstream,
+    ahead,
+    behind,
+    staged,
+    unstaged,
+    untracked,
+    conflicted,
+    is_clean:
+      staged.length === 0 &&
+      unstaged.length === 0 &&
+      untracked.length === 0 &&
+      conflicted.length === 0,
+  };
+}
+
+// ── Log ──────────────────────────────────────────────────────────────────
+
+const LOG_DELIMITER = "---LOCOWORKER_COMMIT_DELIMITER---";
+const LOG_FORMAT = [
+  "%H",    // full hash
+  "%h",    // short hash
+  "%an",   // author name
+  "%ae",   // author email
+  "%aI",   // author date ISO 8601
+  "%s",    // subject
+  "%b",    // body
+].join("%n") + `%n${LOG_DELIMITER}`;
+
+export function buildLogFormat(): string {
+  return `--format=${LOG_FORMAT}`;
+}
+
+export function parseLog(raw: string): GitLogResult {
+  const commits: GitCommit[] = [];
+  const blocks = raw.split(LOG_DELIMITER).map((b) => b.trim()).filter(Boolean);
+
+  for (const block of blocks) {
+    const lines = block.split("\n");
+    if (lines.length < 6) continue;
+
+    commits.push({
+      hash: lines[0].trim(),
+      short_hash: lines[1].trim(),
+      author_name: lines[2].trim(),
+      author_email: lines[3].trim(),
+      date: lines[4].trim(),
+      subject: lines[5].trim(),
+      body: lines.slice(6).join("\n").trim() || undefined,
+    });
+  }
+
+  return { commits, total_returned: commits.length };
+}
+
+// ── Branch ───────────────────────────────────────────────────────────────
+
+export function parseBranches(raw: string): GitBranchResult {
+  const branches: GitBranchResult["branches"] = [];
+  let current = "";
+
+  for (const line of raw.split("\n").filter(Boolean)) {
+    const isCurrent = line.startsWith("*");
+    const name = line.replace(/^\*?\s+/, "").split(" ->")[0].trim();
+    const isRemote = name.startsWith("remotes/");
+
+    if (isCurrent) current = name;
+
+    branches.push({
+      name,
+      is_current: isCurrent,
+      is_remote: isRemote,
+    });
+  }
+
+  return { current, branches };
+}
+
+// ── Stash ─────────────────────────────────────────────────────────────────
+
+export function parseStash(raw: string): GitStashListResult {
+  const stashes: GitStashListResult["stashes"] = [];
+
+  for (const line of raw.split("\n").filter(Boolean)) {
+    // stash@{0}: On main: my changes
+    const m = line.match(/^(stash@\{(\d+)\}):\s+(.+)$/);
+    if (!m) continue;
+    stashes.push({
+      index: parseInt(m[2], 10),
+      ref: m[1],
+      description: m[3].trim(),
+    });
+  }
+
+  return { stashes };
+}
+packages/tools-git/src/tools/gitStatusTool.ts
+TypeScript
+
+// packages/tools-git/src/tools/gitStatusTool.ts
+
+import type { ToolDefinition } from "@locoworker/core";
+import { GitStatusInputSchema } from "../types.js";
+import { runGit } from "../gitRunner.js";
+import { parseStatus } from "../parsers.js";
+import { resolve } from "path";
+
+export function makeGitStatusTool(workspaceRoot: string): ToolDefinition {
+  return {
+    name: "git_status",
+    description: [
+      "Show the working tree status of a git repository.",
+      "Returns branch info, staged/unstaged changes, untracked files, and conflicts.",
+      "Always use this before committing or after making file changes.",
+    ].join(" "),
+    schema: GitStatusInputSchema,
+    requiredPermission: "READ_ONLY",
+    parallelSafe: true,
+    timeout: 10_000,
+    handler: async (input: unknown) => {
+      const parsed = GitStatusInputSchema.parse(input);
+      const cwd = resolve(workspaceRoot, parsed.path);
+
+      // Get short status + branch
+      const raw = runGit(["status", "--porcelain=v1", "--branch"], { cwd });
+      const lines = raw.split("\n");
+      const branchLine = lines.find((l) => l.startsWith("##")) ?? "";
+      const statusLines = lines.filter((l) => !l.startsWith("##")).join("\n");
+
+      return parseStatus(statusLines, branchLine);
+    },
+  };
+}
+packages/tools-git/src/tools/gitDiffTool.ts
+TypeScript
+
+// packages/tools-git/src/tools/gitDiffTool.ts
+
+import type { ToolDefinition } from "@locoworker/core";
+import { GitDiffInputSchema } from "../types.js";
+import { runGit } from "../gitRunner.js";
+import { resolve } from "path";
+
+export function makeGitDiffTool(workspaceRoot: string): ToolDefinition {
+  return {
+    name: "git_diff",
+    description: [
+      "Show git diff output.",
+      "Use staged: true to see staged changes, staged: false for unstaged.",
+      "Optionally scope to a specific file or ref range.",
+      "Output is truncated to max_bytes (default 128 KB).",
+    ].join(" "),
+    schema: GitDiffInputSchema,
+    requiredPermission: "READ_ONLY",
+    parallelSafe: true,
+    timeout: 15_000,
+    handler: async (input: unknown) => {
+      const parsed = GitDiffInputSchema.parse(input);
+      const cwd = resolve(workspaceRoot, parsed.path);
+
+      const args: string[] = ["diff", `--unified=${parsed.context_lines}`];
+
+      if (parsed.staged) args.push("--cached");
+      if (parsed.from_ref) args.push(parsed.from_ref);
+      if (parsed.to_ref) args.push(parsed.to_ref);
+      if (parsed.file) { args.push("--"); args.push(parsed.file); }
+
+      const raw = runGit(args, { cwd, maxBuffer: parsed.max_bytes * 2 });
+
+      const encoder = new TextEncoder();
+      const bytes = encoder.encode(raw).length;
+      const truncated = bytes > parsed.max_bytes;
+
+      const diff = truncated
+        ? new TextDecoder().decode(
+            encoder.encode(raw).slice(0, parsed.max_bytes)
+          ) + "\n... (truncated)"
+        : raw;
+
+      const filesChanged = (diff.match(/^diff --git/gm) ?? []).length;
+
+      return { diff, truncated, bytes, files_changed: filesChanged };
+    },
+  };
+}
+packages/tools-git/src/tools/gitLogTool.ts
+TypeScript
+
+// packages/tools-git/src/tools/gitLogTool.ts
+
+import type { ToolDefinition } from "@locoworker/core";
+import { GitLogInputSchema } from "../types.js";
+import { runGit } from "../gitRunner.js";
+import { buildLogFormat, parseLog } from "../parsers.js";
+import { resolve } from "path";
+
+export function makeGitLogTool(workspaceRoot: string): ToolDefinition {
+  return {
+    name: "git_log",
+    description: [
+      "Show git commit history with author, date, and message.",
+      "Supports filtering by file, author, date range, and commit message grep.",
+      "Returns structured commit objects (hash, author, date, subject, body).",
+    ].join(" "),
+    schema: GitLogInputSchema,
+    requiredPermission: "READ_ONLY",
+    parallelSafe: true,
+    timeout: 15_000,
+    handler: async (input: unknown) => {
+      const parsed = GitLogInputSchema.parse(input);
+      const cwd = resolve(workspaceRoot, parsed.path);
+
+      const args: string[] = ["log", buildLogFormat(), `-${parsed.limit}`];
+
+      if (parsed.from_ref && parsed.to_ref) {
+        args.push(`${parsed.from_ref}..${parsed.to_ref}`);
+      } else if (parsed.from_ref) {
+        args.push(parsed.from_ref);
+      }
+      if (parsed.author) args.push(`--author=${parsed.author}`);
+      if (parsed.since) args.push(`--since=${parsed.since}`);
+      if (parsed.grep) args.push(`--grep=${parsed.grep}`);
+      if (parsed.file) { args.push("--"); args.push(parsed.file); }
+
+      const raw = runGit(args, { cwd });
+      return parseLog(raw);
+    },
+  };
+}
+packages/tools-git/src/tools/gitShowTool.ts
+TypeScript
+
+// packages/tools-git/src/tools/gitShowTool.ts
+
+import type { ToolDefinition } from "@locoworker/core";
+import { GitShowInputSchema } from "../types.js";
+import { runGit } from "../gitRunner.js";
+import { resolve } from "path";
+
+export function makeGitShowTool(workspaceRoot: string): ToolDefinition {
+  return {
+    name: "git_show",
+    description: [
+      "Show a git object (commit, tag, tree, blob) or the contents of a file at a specific ref.",
+      "Use ref to specify a commit hash or branch name.",
+      "Optionally specify file to show only that file at the given ref.",
+    ].join(" "),
+    schema: GitShowInputSchema,
+    requiredPermission: "READ_ONLY",
+    parallelSafe: true,
+    timeout: 15_000,
+    handler: async (input: unknown) => {
+      const parsed = GitShowInputSchema.parse(input);
+      const cwd = resolve(workspaceRoot, parsed.path);
+
+      const target = parsed.file
+        ? `${parsed.ref}:${parsed.file}`
+        : parsed.ref;
+
+      const raw = runGit(["show", target], {
+        cwd,
+        maxBuffer: parsed.max_bytes * 2,
+      });
+
+      const encoder = new TextEncoder();
+      const bytes = encoder.encode(raw);
+      const truncated = bytes.length > parsed.max_bytes;
+      const content = truncated
+        ? new TextDecoder().decode(bytes.slice(0, parsed.max_bytes)) +
+          "\n... (truncated)"
+        : raw;
+
+      return { ref: parsed.ref, content, truncated };
+    },
+  };
+}
+packages/tools-git/src/tools/gitBranchTool.ts
+TypeScript
+
+// packages/tools-git/src/tools/gitBranchTool.ts
+
+import type { ToolDefinition } from "@locoworker/core";
+import { GitBranchInputSchema } from "../types.js";
+import { runGit } from "../gitRunner.js";
+import { parseBranches } from "../parsers.js";
+import { resolve } from "path";
+
+export function makeGitBranchTool(workspaceRoot: string): ToolDefinition {
+  return {
+    name: "git_branch",
+    description: [
+      "List git branches.",
+      "Use all: true to include remote-tracking branches.",
+      "Returns current branch and all available branches.",
+    ].join(" "),
+    schema: GitBranchInputSchema,
+    requiredPermission: "READ_ONLY",
+    parallelSafe: true,
+    timeout: 10_000,
+    handler: async (input: unknown) => {
+      const parsed = GitBranchInputSchema.parse(input);
+      const cwd = resolve(workspaceRoot, parsed.path);
+
+      const args = ["branch", "-vv"];
+      if (parsed.all) args.push("--all");
+      else if (parsed.remotes) args.push("--remotes");
+
+      const raw = runGit(args, { cwd });
+      return parseBranches(raw);
+    },
+  };
+}
+packages/tools-git/src/index.ts
+TypeScript
+
+// packages/tools-git/src/index.ts
+
+export * from "./types.js";
+export * from "./gitRunner.js";
+export * from "./parsers.js";
+export { makeGitStatusTool } from "./tools/gitStatusTool.js";
+export { makeGitDiffTool } from "./tools/gitDiffTool.js";
+export { makeGitLogTool } from "./tools/gitLogTool.js";
+export { makeGitShowTool } from "./tools/gitShowTool.js";
+export { makeGitBranchTool } from "./tools/gitBranchTool.js";
+
+import type { ToolRegistry } from "@locoworker/core";
+import { makeGitStatusTool } from "./tools/gitStatusTool.js";
+import { makeGitDiffTool } from "./tools/gitDiffTool.js";
+import { makeGitLogTool } from "./tools/gitLogTool.js";
+import { makeGitShowTool } from "./tools/gitShowTool.js";
+import { makeGitBranchTool } from "./tools/gitBranchTool.js";
+
+export function registerGitTools(registry: ToolRegistry, workspaceRoot: string): void {
+  registry.register(makeGitStatusTool(workspaceRoot));
+  registry.register(makeGitDiffTool(workspaceRoot));
+  registry.register(makeGitLogTool(workspaceRoot));
+  registry.register(makeGitShowTool(workspaceRoot));
+  registry.register(makeGitBranchTool(workspaceRoot));
+}
+packages/tools-git/src/__tests__/parsers.test.ts
+TypeScript
+
+// packages/tools-git/src/__tests__/parsers.test.ts
+
+import { describe, it, expect } from "bun:test";
+import { parseStatus, parseBranches, parseStash } from "../parsers.js";
+
+const STATUS_RAW = ` M src/index.ts\nM  src/foo.ts\n?? newfile.ts\nUU conflict.ts`;
+const BRANCH_RAW = `## main...origin/main [ahead 2, behind 1]`;
+
+describe("parseStatus", () => {
+  it("parses staged, unstaged, untracked, conflicted", () => {
+    const result = parseStatus(STATUS_RAW, BRANCH_RAW);
+    expect(result.branch).toBe("main");
+    expect(result.upstream).toBe("origin/main");
+    expect(result.ahead).toBe(2);
+    expect(result.behind).toBe(1);
+    expect(result.untracked).toContain("newfile.ts");
+    expect(result.conflicted).toContain("conflict.ts");
+    expect(result.is_clean).toBe(false);
+  });
+
+  it("detects clean repo", () => {
+    const result = parseStatus("", "## main...origin/main");
+    expect(result.is_clean).toBe(true);
+  });
+});
+
+const BRANCH_LIST_RAW = `* main
+  feature/foo
+  remotes/origin/main`;
+
+describe("parseBranches", () => {
+  it("identifies current branch", () => {
+    const result = parseBranches(BRANCH_LIST_RAW);
+    expect(result.current).toBe("main");
+    expect(result.branches.length).toBe(3);
+    expect(result.branches[0].is_current).toBe(true);
+  });
+
+  it("identifies remote branches", () => {
+    const result = parseBranches(BRANCH_LIST_RAW);
+    const remote = result.branches.find((b) => b.is_remote);
+    expect(remote?.name).toContain("remotes/");
+  });
+});
+
+const STASH_RAW = `stash@{0}: On main: my wip changes\nstash@{1}: WIP on feature: abc1234 message`;
+
+describe("parseStash", () => {
+  it("parses stash list", () => {
+    const { stashes } = parseStash(STASH_RAW);
+    expect(stashes.length).toBe(2);
+    expect(stashes[0].index).toBe(0);
+    expect(stashes[0].ref).toBe("stash@{0}");
+    expect(stashes[1].index).toBe(1);
+  });
+});
+packages/tools-search — @locoworker/tools-search
+packages/tools-search/package.json
+JSON
+
+{
+  "name": "@locoworker/tools-search",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc --build",
+    "dev": "tsc --build --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "clean": "rm -rf dist tsconfig.tsbuildinfo"
+  },
+  "dependencies": {
+    "zod": "^3.23.0",
+    "fast-glob": "^3.3.2"
+  },
+  "peerDependencies": {
+    "@locoworker/core": "workspace:*",
+    "@locoworker/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "@locoworker/core": "workspace:*",
+    "@locoworker/shared": "workspace:*",
+    "typescript": "^5.4.0",
+    "@types/node": "^20.12.0"
+  }
+}
+packages/tools-search/tsconfig.json
+JSON
+
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "composite": true,
+    "declarationMap": true
+  },
+  "include": ["src/**/*"],
+  "references": [
+    { "path": "../core" },
+    { "path": "../shared" }
+  ],
+  "exclude": ["node_modules", "dist"]
+}
+packages/tools-search/src/types.ts
+TypeScript
+
+// packages/tools-search/src/types.ts
+
+import { z } from "zod";
+
+// ── grep_files ────────────────────────────────────────────────────────────
+
+export const GrepFilesInputSchema = z.object({
+  pattern: z.string().min(1).describe("Regex or literal search pattern"),
+  path: z.string().default(".").describe("Directory to search (relative to workspace)"),
+  include: z.array(z.string()).default([]).describe("Glob patterns to include, e.g. ['**/*.ts']"),
+  exclude: z.array(z.string()).default([]).describe("Glob patterns to exclude"),
+  case_sensitive: z.boolean().default(true),
+  max_results: z.number().int().min(1).max(2000).default(200),
+  context_lines: z.number().int().min(0).max(10).default(0),
+  include_binary: z.boolean().default(false),
+});
+export type GrepFilesInput = z.infer<typeof GrepFilesInputSchema>;
+
+export interface GrepMatch {
+  file: string;
+  line: number;
+  column: number;
+  text: string;
+  context_before?: string[];
+  context_after?: string[];
+}
+
+export interface GrepFilesResult {
+  matches: GrepMatch[];
+  total_matches: number;
+  files_searched: number;
+  files_with_matches: number;
+  truncated: boolean;
+  pattern: string;
+}
+
+// ── find_files ────────────────────────────────────────────────────────────
+
+export const FindFilesInputSchema = z.object({
+  pattern: z.string().min(1).describe("Glob pattern, e.g. '**/*.test.ts'"),
+  path: z.string().default("."),
+  exclude: z.array(z.string()).default([
+    "**/node_modules/**",
+    "**/.git/**",
+    "**/dist/**",
+  ]),
+  max_results: z.number().int().min(1).max(5000).default(500),
+  include_dirs: z.boolean().default(false),
+  sort_by: z.enum(["name", "modified", "size"]).default("name"),
+});
+export type FindFilesInput = z.infer<typeof FindFilesInputSchema>;
+
+export interface FoundFile {
+  path: string;
+  name: string;
+  size_bytes: number;
+  modified_at: string;  // ISO 8601
+  is_directory: boolean;
+}
+
+export interface FindFilesResult {
+  files: FoundFile[];
+  total: number;
+  truncated: boolean;
+}
+
+// ── search_in_file ────────────────────────────────────────────────────────
+
+export const SearchInFileInputSchema = z.object({
+  file: z.string().min(1),
+  pattern: z.string().min(1),
+  case_sensitive: z.boolean().default(true),
+  max_results: z.number().int().min(1).max(500).default(50),
+  context_lines: z.number().int().min(0).max(20).default(2),
+});
+export type SearchInFileInput = z.infer<typeof SearchInFileInputSchema>;
+
+export interface SearchInFileResult {
+  file: string;
+  matches: GrepMatch[];
+  total: number;
+  truncated: boolean;
+}
+packages/tools-search/src/grepEngine.ts
+TypeScript
+
+// packages/tools-search/src/grepEngine.ts
+// Pure-TypeScript grep implementation (no ripgrep binary dependency)
+
+import { readFileSync, statSync } from "fs";
+import { join, relative, resolve } from "path";
+import fg from "fast-glob";
+import type { GrepFilesInput, GrepFilesResult, GrepMatch } from "./types.js";
+
+const BINARY_SNIFF_BYTES = 512;
+
+function isBinary(filepath: string): boolean {
+  try {
+    const buf = Buffer.alloc(BINARY_SNIFF_BYTES);
+    const fd = require("fs").openSync(filepath, "r");
+    const bytesRead = require("fs").readSync(fd, buf, 0, BINARY_SNIFF_BYTES, 0);
+    require("fs").closeSync(fd);
+    // Check for null bytes (strong binary indicator)
+    for (let i = 0; i < bytesRead; i++) {
+      if (buf[i] === 0) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+export async function grepFiles(
+  input: GrepFilesInput,
+  workspaceRoot: string
+): Promise<GrepFilesResult> {
+  const cwd = resolve(workspaceRoot, input.path);
+  const flags = input.case_sensitive ? "" : "i";
+  let regex: RegExp;
+  try {
+    regex = new RegExp(input.pattern, flags);
+  } catch {
+    throw new Error(`Invalid regex pattern: ${input.pattern}`);
+  }
+
+  const includePatterns = input.include.length > 0 ? input.include : ["**/*"];
+  const excludePatterns = [
+    "**/node_modules/**",
+    "**/.git/**",
+    "**/dist/**",
+    "**/.locoworker/**",
+    ...input.exclude,
+  ];
+
+  const allFiles = await fg(includePatterns, {
+    cwd,
+    ignore: excludePatterns,
+    absolute: true,
+    onlyFiles: true,
+    dot: false,
+  });
+
+  const matches: GrepMatch[] = [];
+  let filesSearched = 0;
+  const filesWithMatches = new Set<string>();
+  let truncated = false;
+
+  for (const filepath of allFiles) {
+    if (matches.length >= input.max_results) {
+      truncated = true;
+      break;
+    }
+
+    if (!input.include_binary && isBinary(filepath)) continue;
+
+    let content: string;
+    try {
+      content = readFileSync(filepath, "utf-8");
+    } catch {
+      continue;
+    }
+    filesSearched++;
+
+    const lines = content.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      if (matches.length >= input.max_results) { truncated = true; break; }
+
+      const line = lines[i];
+      const match = regex.exec(line);
+      if (!match) continue;
+
+      const relPath = relative(workspaceRoot, filepath);
+      filesWithMatches.add(relPath);
+
+      const grepMatch: GrepMatch = {
+        file: relPath,
+        line: i + 1,
+        column: match.index + 1,
+        text: line,
+      };
+
+      if (input.context_lines > 0) {
+        grepMatch.context_before = lines
+          .slice(Math.max(0, i - input.context_lines), i)
+          .map((l) => l);
+        grepMatch.context_after = lines
+          .slice(i + 1, i + 1 + input.context_lines)
+          .map((l) => l);
+      }
+
+      matches.push(grepMatch);
+    }
+  }
+
+  return {
+    matches,
+    total_matches: matches.length,
+    files_searched: filesSearched,
+    files_with_matches: filesWithMatches.size,
+    truncated,
+    pattern: input.pattern,
+  };
+}
+packages/tools-search/src/tools/grepFilesTool.ts
+TypeScript
+
+// packages/tools-search/src/tools/grepFilesTool.ts
+
+import type { ToolDefinition } from "@locoworker/core";
+import { GrepFilesInputSchema } from "../types.js";
+import { grepFiles } from "../grepEngine.js";
+
+export function makeGrepFilesTool(workspaceRoot: string): ToolDefinition {
+  return {
+    name: "grep_files",
+    description: [
+      "Search for a regex or literal pattern across files in the workspace.",
+      "Returns matching lines with file path, line number, and column.",
+      "Supports include/exclude glob patterns and optional context lines.",
+      "Skips binary files by default. Max 200 results (configurable).",
+    ].join(" "),
+    schema: GrepFilesInputSchema,
+    requiredPermission: "READ_ONLY",
+    parallelSafe: true,
+    timeout: 30_000,
+    handler: async (input: unknown) => {
+      const parsed = GrepFilesInputSchema.parse(input);
+      return await grepFiles(parsed, workspaceRoot);
+    },
+  };
+}
+packages/tools-search/src/tools/findFilesTool.ts
+TypeScript
+
+// packages/tools-search/src/tools/findFilesTool.ts
+
+import type { ToolDefinition } from "@locoworker/core";
+import { FindFilesInputSchema } from "../types.js";
+import fg from "fast-glob";
+import { statSync } from "fs";
+import { resolve, relative } from "path";
+import type { FoundFile, FindFilesResult } from "../types.js";
+
+export function makeFindFilesTool(workspaceRoot: string): ToolDefinition {
+  return {
+    name: "find_files",
+    description: [
+      "Find files in the workspace matching a glob pattern.",
+      "Returns file paths, sizes, and modification times.",
+      "Supports sorting by name, modified date, or size.",
+      "Use this to discover files before reading them.",
+    ].join(" "),
+    schema: FindFilesInputSchema,
+    requiredPermission: "READ_ONLY",
+    parallelSafe: true,
+    timeout: 20_000,
+    handler: async (input: unknown) => {
+      const parsed = FindFilesInputSchema.parse(input);
+      const cwd = resolve(workspaceRoot, parsed.path);
+
+      const found = await fg(parsed.pattern, {
+        cwd,
+        ignore: parsed.exclude,
+        absolute: true,
+        onlyFiles: !parsed.include_dirs,
+        dot: false,
+      });
+
+      let files: FoundFile[] = [];
+      for (const f of found.slice(0, parsed.max_results)) {
+        try {
+          const stat = statSync(f);
+          files.push({
+            path: relative(workspaceRoot, f),
+            name: f.split("/").pop() ?? f,
+            size_bytes: stat.size,
+            modified_at: stat.mtime.toISOString(),
+            is_directory: stat.isDirectory(),
+          });
+        } catch {
+          // skip
+        }
+      }
+
+      if (parsed.sort_by === "modified") {
+        files.sort((a, b) => b.modified_at.localeCompare(a.modified_at));
+      } else if (parsed.sort_by === "size") {
+        files.sort((a, b) => b.size_bytes - a.size_bytes);
+      } else {
+        files.sort((a, b) => a.path.localeCompare(b.path));
+      }
+
+      return {
+        files,
+        total: files.length,
+        truncated: found.length > parsed.max_results,
+      } satisfies FindFilesResult;
+    },
+  };
+}
+packages/tools-search/src/tools/searchInFileTool.ts
+TypeScript
+
+// packages/tools-search/src/tools/searchInFileTool.ts
+
+import type { ToolDefinition } from "@locoworker/core";
+import { SearchInFileInputSchema } from "../types.js";
+import { readFileSync } from "fs";
+import { resolve, relative } from "path";
+import type { GrepMatch } from "../types.js";
+
+export function makeSearchInFileTool(workspaceRoot: string): ToolDefinition {
+  return {
+    name: "search_in_file",
+    description: [
+      "Search for a pattern within a single file.",
+      "Returns matching lines with line numbers and optional context.",
+      "More efficient than grep_files when you already know which file to search.",
+    ].join(" "),
+    schema: SearchInFileInputSchema,
+    requiredPermission: "READ_ONLY",
+    parallelSafe: true,
+    timeout: 10_000,
+    handler: async (input: unknown) => {
+      const parsed = SearchInFileInputSchema.parse(input);
+      const filepath = resolve(workspaceRoot, parsed.file);
+
+      let content: string;
+      try {
+        content = readFileSync(filepath, "utf-8");
+      } catch (err) {
+        throw new Error(`Cannot read file: ${parsed.file}`);
+      }
+
+      const flags = parsed.case_sensitive ? "" : "i";
+      let regex: RegExp;
+      try {
+        regex = new RegExp(parsed.pattern, flags);
+      } catch {
+        throw new Error(`Invalid regex pattern: ${parsed.pattern}`);
+      }
+
+      const lines = content.split("\n");
+      const matches: GrepMatch[] = [];
+      let truncated = false;
+
+      for (let i = 0; i < lines.length; i++) {
+        if (matches.length >= parsed.max_results) { truncated = true; break; }
+
+        const line = lines[i];
+        const match = regex.exec(line);
+        if (!match) continue;
+
+        const grepMatch: GrepMatch = {
+          file: relative(workspaceRoot, filepath),
+          line: i + 1,
+          column: match.index + 1,
+          text: line,
+        };
+
+        if (parsed.context_lines > 0) {
+          grepMatch.context_before = lines.slice(
+            Math.max(0, i - parsed.context_lines),
+            i
+          );
+          grepMatch.context_after = lines.slice(
+            i + 1,
+            i + 1 + parsed.context_lines
+          );
+        }
+
+        matches.push(grepMatch);
+      }
+
+      return {
+        file: parsed.file,
+        matches,
+        total: matches.length,
+        truncated,
+      };
+    },
+  };
+}
+packages/tools-search/src/index.ts
+TypeScript
+
+// packages/tools-search/src/index.ts
+
+export * from "./types.js";
+export * from "./grepEngine.js";
+export { makeGrepFilesTool } from "./tools/grepFilesTool.js";
+export { makeFindFilesTool } from "./tools/findFilesTool.js";
+export { makeSearchInFileTool } from "./tools/searchInFileTool.js";
+
+import type { ToolRegistry } from "@locoworker/core";
+import { makeGrepFilesTool } from "./tools/grepFilesTool.js";
+import { makeFindFilesTool } from "./tools/findFilesTool.js";
+import { makeSearchInFileTool } from "./tools/searchInFileTool.js";
+
+export function registerSearchTools(registry: ToolRegistry, workspaceRoot: string): void {
+  registry.register(makeGrepFilesTool(workspaceRoot));
+  registry.register(makeFindFilesTool(workspaceRoot));
+  registry.register(makeSearchInFileTool(workspaceRoot));
+}
+packages/tools-search/src/__tests__/grepEngine.test.ts
+TypeScript
+
+// packages/tools-search/src/__tests__/grepEngine.test.ts
+
+import { describe, it, expect, beforeAll, afterAll } from "bun:test";
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "fs";
+import { join, tmpdir } from "path";
+import { grepFiles } from "../grepEngine.js";
+
+let tmpDir: string;
+
+beforeAll(() => {
+  tmpDir = mkdtempSync(join(tmpdir(), "locoworker-search-test-"));
+  writeFileSync(join(tmpDir, "alpha.ts"), `export const foo = "hello world";\nexport const bar = 42;\n`);
+  writeFileSync(join(tmpDir, "beta.ts"), `import { foo } from "./alpha.js";\nconsole.log(foo);\n`);
+  writeFileSync(join(tmpDir, "README.md"), `# Hello\nThis is a README.\n`);
+  mkdirSync(join(tmpDir, "node_modules"), { recursive: true });
+  writeFileSync(join(tmpDir, "node_modules", "ignored.ts"), `should not appear`);
+});
+
+afterAll(() => {
+  rmSync(tmpDir, { recursive: true, force: true });
+});
+
+describe("grepFiles", () => {
+  it("finds pattern across files", async () => {
+    const result = await grepFiles(
+      { pattern: "foo", path: ".", include: [], exclude: [], case_sensitive: true, max_results: 200, context_lines: 0, include_binary: false },
+      tmpDir
+    );
+    expect(result.total_matches).toBeGreaterThan(0);
+    expect(result.matches.some((m) => m.file.includes("alpha"))).toBe(true);
+  });
+
+  it("respects case_sensitive: false", async () => {
+    const result = await grepFiles(
+      { pattern: "HELLO", path: ".", include: [], exclude: [], case_sensitive: false, max_results: 200, context_lines: 0, include_binary: false },
+      tmpDir
+    );
+    expect(result.total_matches).toBeGreaterThan(0);
+  });
+
+  it("excludes node_modules", async () => {
+    const result = await grepFiles(
+      { pattern: "should not appear", path: ".", include: [], exclude: [], case_sensitive: true, max_results: 200, context_lines: 0, include_binary: false },
+      tmpDir
+    );
+    expect(result.total_matches).toBe(0);
+  });
+
+  it("includes context lines when requested", async () => {
+    const result = await grepFiles(
+      { pattern: "bar", path: ".", include: ["**/*.ts"], exclude: [], case_sensitive: true, max_results: 200, context_lines: 1, include_binary: false },
+      tmpDir
+    );
+    const match = result.matches[0];
+    expect(match?.context_before).toBeDefined();
+    expect(match?.context_after).toBeDefined();
+  });
+
+  it("respects max_results", async () => {
+    const result = await grepFiles(
+      { pattern: ".", path: ".", include: [], exclude: [], case_sensitive: true, max_results: 2, context_lines: 0, include_binary: false },
+      tmpDir
+    );
+    expect(result.matches.length).toBeLessThanOrEqual(2);
+    expect(result.truncated).toBe(true);
+  });
+
+  it("throws on invalid regex", async () => {
+    await expect(
+      grepFiles(
+        { pattern: "[invalid", path: ".", include: [], exclude: [], case_sensitive: true, max_results: 200, context_lines: 0, include_binary: false },
+        tmpDir
+      )
+    ).rejects.toThrow("Invalid regex");
+  });
+});
+Pass 11 Part 2 — Complete Bootstrap Entrypoint
+This is the glue that pulls everything together for use in the Gateway or CLI bootstrap:
+
+packages/tools-web/src/tools-web.bootstrap.ts
+TypeScript
+
+// Convenience barrel for registering ALL Pass-11 tool packages
+// Used in apps/gateway/src/bootstrap.ts and apps/cli/src/bootstrap.ts
+
+import type { ToolRegistry } from "@locoworker/core";
+import { registerFsTools } from "@locoworker/tools-fs";
+import { registerBashTools } from "@locoworker/tools-bash";
+import { registerGitTools } from "@locoworker/tools-git";
+import { registerSearchTools } from "@locoworker/tools-search";
+import { registerWebTools } from "@locoworker/tools-web";
+
+export interface RegisterAllToolsOptions {
+  workspaceRoot: string;
+  enableWeb?: boolean;     // default: true (requires NETWORK permission)
+  enableBash?: boolean;    // default: true (requires SHELL permission)
+  enableGit?: boolean;     // default: true
+}
+
+export function registerAllTools(
+  registry: ToolRegistry,
+  opts: RegisterAllToolsOptions
+): void {
+  const { workspaceRoot, enableWeb = true, enableBash = true, enableGit = true } = opts;
+
+  // Always registered (READ_ONLY + WRITE_LOCAL)
+  registerFsTools(registry, workspaceRoot);
+  registerSearchTools(registry, workspaceRoot);
+
+  // Optional by capability
+  if (enableBash) registerBashTools(registry, workspaceRoot);
+  if (enableGit) registerGitTools(registry, workspaceRoot);
+  if (enableWeb) registerWebTools(registry);
+}
+Final Updated Dependency Graph (Pass 1 → Pass 11 Complete)
+mermaid
+
+graph TD
+  shared["@locoworker/shared"]
+  core["@locoworker/core"] --> shared
+
+  memory["@locoworker/memory"] --> core --> shared
+  graphify["@locoworker/graphify"] --> core
+  wiki["@locoworker/wiki"] --> core
+  kairos["@locoworker/kairos"] --> core
+  orchestrator["@locoworker/orchestrator"] --> core
+
+  gateway["@locoworker/gateway"] --> core
+  gateway --> memory
+  gateway --> graphify
+  gateway --> wiki
+  gateway --> kairos
+  gateway --> orchestrator
+
+  autoresearch["@locoworker/autoresearch"] --> core
+  autoresearch --> memory
+  autoresearch --> graphify
+  autoresearch --> wiki
+  autoresearch --> kairos
+
+  mirofish["@locoworker/mirofish"] --> core
+  mirofish --> memory
+
+  %% Pass 11 Part 1
+  toolsFs["@locoworker/tools-fs"] --> core
+  toolsBash["@locoworker/tools-bash"] --> core
+  toolsBash --> toolsFs
+
+  %% Pass 11 Part 2 (now complete)
+  toolsGit["@locoworker/tools-git"] --> core
+  toolsGit --> shared
+  toolsSearch["@locoworker/tools-search"] --> core
+  toolsSearch --> shared
+  toolsWeb["@locoworker/tools-web"] --> core
+
+  %% Build order (tsc --build)
+  shared --> core --> toolsFs --> toolsBash
+  shared --> toolsGit
+  shared --> toolsSearch
+
+  %% Gateway bootstrap registers all tools
+  gateway -.registerAllTools.-> toolsFs
+  gateway -.registerAllTools.-> toolsBash
+  gateway -.registerAllTools.-> toolsGit
+  gateway -.registerAllTools.-> toolsSearch
+  gateway -.registerAllTools.-> toolsWeb
+Summary of what was generated
+Section	Status
+tools-web — types.ts (complete)	✅
+tools-web — urlSafety.ts	✅
+tools-web — htmlExtractor.ts	✅
+tools-web — fetcher.ts	✅
+tools-web — tools/fetchUrlTool.ts	✅
+tools-web — tools/extractHtmlTool.ts	✅
+tools-web — tools/urlMetadataTool.ts	✅
+tools-web — index.ts + tests	✅
+@locoworker/shared — all 7 modules	✅
+tools-git — types + gitRunner + parsers + 5 tools + index + tests	✅
+tools-search — types + grepEngine + 3 tools + index + tests	✅
+registerAllTools bootstrap barrel	✅
+Final dependency graph (all 18 packages)	✅
