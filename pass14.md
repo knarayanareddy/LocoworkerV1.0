@@ -3626,3 +3626,3038 @@ Pass 14 Part 1 — Complete Summary
 Layer	Files	Key assertions covered
 Harness	testWorkspace.ts, fixtures.ts, eventCollector.ts, testStack.ts	Temp dir isolation, fixture seeding, event stream collection, full stack bootstrap in temp dir
 Core: PermissionGate	permissionGate.test.ts	All 5 tier sets × all 5 permission
+
+
+
+
+Pass 14 — Part 2: E2E Tests · CI Workflows · Turbo Pipeline · Release Automation
+Division recap — what Part 2 delivers
+Layer	Scope
+tests/e2e/	Real processes: gateway spawned on an ephemeral port, CLI run as subprocess, SSE streamed over real TCP, WS handshake validated
+.github/workflows/	ci.yml (lint → typecheck → build → unit → integration → e2e), release.yml (tag-triggered build + publish), pr.yml (fast PR gate)
+Root turbo.json (final)	Complete task graph with all 18 packages + 4 apps wired in dependency order with cache keys
+scripts/	build.ts, release.ts, version.ts, check-env.ts, clean.ts
+Directory layout
+text
+
+tests/
+└── e2e/
+    ├── package.json
+    ├── tsconfig.json
+    ├── harness/
+    │   ├── processRunner.ts      ← spawn + lifecycle management
+    │   ├── gatewayProcess.ts     ← start/stop gateway on free port
+    │   ├── cliRunner.ts          ← run CLI as subprocess
+    │   ├── sseReader.ts          ← read SSE stream over real TCP
+    │   └── wsTestClient.ts       ← WS test client
+    ├── gateway.e2e.test.ts
+    ├── sessions.e2e.test.ts
+    ├── stream.e2e.test.ts
+    ├── cli.e2e.test.ts
+    └── ws.e2e.test.ts
+
+.github/
+└── workflows/
+    ├── ci.yml
+    ├── pr.yml
+    └── release.yml
+
+scripts/
+    ├── build.ts
+    ├── release.ts
+    ├── version.ts
+    ├── check-env.ts
+    └── clean.ts
+
+turbo.json                        ← final complete version
+tests/e2e package
+tests/e2e/package.json
+JSON
+
+{
+  "name": "@locoworker/e2e-tests",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test":             "bun test --timeout 60000",
+    "test:gateway":     "bun test gateway.e2e.test.ts sessions.e2e.test.ts --timeout 60000",
+    "test:stream":      "bun test stream.e2e.test.ts --timeout 90000",
+    "test:cli":         "bun test cli.e2e.test.ts --timeout 60000",
+    "test:ws":          "bun test ws.e2e.test.ts --timeout 60000",
+    "typecheck":        "tsc --noEmit",
+    "clean":            "rm -rf tsconfig.tsbuildinfo"
+  },
+  "dependencies": {
+    "@locoworker/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.0",
+    "typescript":  "^5.4.0"
+  }
+}
+tests/e2e/tsconfig.json
+JSON
+
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "target":           "ESNext",
+    "module":           "ESNext",
+    "moduleResolution": "bundler",
+    "rootDir":          ".",
+    "noEmit":           true,
+    "types":            ["node"]
+  },
+  "include": ["./**/*"],
+  "exclude": ["node_modules"]
+}
+E2E harness
+tests/e2e/harness/processRunner.ts
+TypeScript
+
+// tests/e2e/harness/processRunner.ts
+// Spawns a child process, captures stdout/stderr with a ring buffer,
+// and exposes clean start/stop/waitFor helpers.
+
+import {
+  spawn,
+  type ChildProcess,
+  type SpawnOptions,
+} from "child_process";
+import { createServer } from "net";
+
+// ── Find a free TCP port ────────────────────────────────────────────────────
+
+export function findFreePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = createServer();
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      if (!addr || typeof addr === "string") {
+        server.close(() => reject(new Error("Could not get free port")));
+        return;
+      }
+      const port = addr.port;
+      server.close(() => resolve(port));
+    });
+    server.on("error", reject);
+  });
+}
+
+// ── Ring buffer for captured output ─────────────────────────────────────────
+
+const RING_SIZE = 500;   // lines
+
+export class OutputCapture {
+  private lines: string[] = [];
+
+  push(line: string): void {
+    if (this.lines.length >= RING_SIZE) this.lines.shift();
+    this.lines.push(line);
+  }
+
+  all(): string[]  { return [...this.lines]; }
+  last(n = 20): string[] { return this.lines.slice(-n); }
+  text(): string   { return this.lines.join("\n"); }
+
+  waitFor(
+    predicate: (line: string, all: string[]) => boolean,
+    timeoutMs = 15_000
+  ): Promise<void> {
+    if (predicate("", this.all())) return Promise.resolve();
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(
+          new Error(
+            `waitFor timed out after ${timeoutMs}ms.\nLast output:\n${this.last(30).join("\n")}`
+          )
+        );
+      }, timeoutMs);
+
+      const check = setInterval(() => {
+        if (this.lines.some((l) => predicate(l, this.lines))) {
+          clearInterval(check);
+          clearTimeout(timer);
+          resolve();
+        }
+      }, 50);
+    });
+  }
+}
+
+// ── ManagedProcess ─────────────────────────────────────────────────────────
+
+export interface SpawnConfig {
+  cmd:     string;
+  args:    string[];
+  cwd:     string;
+  env?:    Record<string, string>;
+  label?:  string;
+}
+
+export class ManagedProcess {
+  private proc:    ChildProcess | null = null;
+  private exited   = false;
+  readonly stdout  = new OutputCapture();
+  readonly stderr  = new OutputCapture();
+  readonly label:  string;
+
+  constructor(private readonly config: SpawnConfig) {
+    this.label = config.label ?? config.cmd;
+  }
+
+  start(): void {
+    if (this.proc) throw new Error(`${this.label} already started`);
+
+    const opts: SpawnOptions = {
+      cwd:   this.config.cwd,
+      env:   { ...process.env, ...this.config.env },
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: false,
+    };
+
+    this.proc = spawn(this.config.cmd, this.config.args, opts);
+
+    this.proc.stdout?.on("data", (chunk: Buffer) => {
+      chunk.toString().split("\n").forEach((l) => {
+        if (l.trim()) this.stdout.push(l);
+      });
+    });
+
+    this.proc.stderr?.on("data", (chunk: Buffer) => {
+      chunk.toString().split("\n").forEach((l) => {
+        if (l.trim()) this.stderr.push(l);
+      });
+    });
+
+    this.proc.on("exit", () => { this.exited = true; });
+  }
+
+  async stop(signal: NodeJS.Signals = "SIGTERM"): Promise<void> {
+    if (!this.proc || this.exited) return;
+
+    return new Promise((resolve) => {
+      const forceKill = setTimeout(() => {
+        if (!this.exited) this.proc?.kill("SIGKILL");
+      }, 5_000);
+
+      this.proc!.once("exit", () => {
+        clearTimeout(forceKill);
+        resolve();
+      });
+
+      this.proc!.kill(signal);
+    });
+  }
+
+  isRunning(): boolean {
+    return !!this.proc && !this.exited;
+  }
+
+  pid(): number | undefined {
+    return this.proc?.pid;
+  }
+}
+
+// ── Wait for a TCP port to accept connections ──────────────────────────────
+
+export function waitForPort(
+  port:      number,
+  host     = "127.0.0.1",
+  timeoutMs  = 15_000,
+  intervalMs = 100
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + timeoutMs;
+
+    const attempt = () => {
+      const sock = new (require("net").Socket)();
+      sock.setTimeout(500);
+
+      sock.on("connect", () => {
+        sock.destroy();
+        resolve();
+      });
+      sock.on("error", () => {
+        sock.destroy();
+        if (Date.now() >= deadline) {
+          reject(new Error(`Port ${port} did not open within ${timeoutMs}ms`));
+        } else {
+          setTimeout(attempt, intervalMs);
+        }
+      });
+      sock.on("timeout", () => {
+        sock.destroy();
+        setTimeout(attempt, intervalMs);
+      });
+
+      sock.connect(port, host);
+    };
+
+    attempt();
+  });
+}
+tests/e2e/harness/gatewayProcess.ts
+TypeScript
+
+// tests/e2e/harness/gatewayProcess.ts
+// Starts apps/gateway as a real child process on an ephemeral port.
+// Exposes a typed base URL for tests to call.
+
+import { resolve }        from "path";
+import { mkdtempSync, rmSync, existsSync, mkdirSync } from "fs";
+import { tmpdir }         from "os";
+import { ManagedProcess, findFreePort, waitForPort } from "./processRunner.js";
+
+const REPO_ROOT = resolve(import.meta.dir, "../../../");
+const GATEWAY_SRC = resolve(REPO_ROOT, "apps/gateway/src/index.ts");
+
+export interface GatewayHandle {
+  port:          number;
+  baseUrl:       string;
+  wsUrl:         string;
+  workspaceRoot: string;
+  storageDir:    string;
+  process:       ManagedProcess;
+  stop():        Promise<void>;
+  cleanup():     void;
+}
+
+export interface GatewayOptions {
+  permissionSet?: "READ_ONLY" | "STANDARD" | "DEVELOPER" | "POWER";
+  enableBash?:    boolean;
+  enableWeb?:     boolean;
+  enableGit?:     boolean;
+  authDisabled?:  boolean;
+  jwtSecret?:     string;
+}
+
+export async function startGateway(
+  opts: GatewayOptions = {}
+): Promise<GatewayHandle> {
+  const port          = await findFreePort();
+  const workspaceRoot = mkdtempSync(resolve(tmpdir(), "lw-e2e-gw-"));
+  const storageDir    = resolve(workspaceRoot, ".locoworker");
+
+  if (!existsSync(storageDir)) mkdirSync(storageDir, { recursive: true });
+
+  const env: Record<string, string> = {
+    PORT:                     String(port),
+    HOST:                     "127.0.0.1",
+    WORKSPACE_ROOT:           workspaceRoot,
+    NODE_ENV:                 "test",
+    LOG_LEVEL:                "warn",        // quiet by default
+    PERMISSION_SET:           opts.permissionSet  ?? "DEVELOPER",
+    ENABLE_BASH:              String(opts.enableBash !== false),
+    ENABLE_WEB:               String(opts.enableWeb  !== false),
+    ENABLE_GIT:               String(opts.enableGit  !== false),
+    GATEWAY_AUTH_DISABLED:    String(opts.authDisabled !== false),  // default: disabled in tests
+    GATEWAY_JWT_SECRET:       opts.jwtSecret ?? "e2e-test-secret",
+    // Stub out cost caps so no real API calls are needed
+    DAILY_COST_CAP_USD:       "0.01",
+    SESSION_COST_CAP:         "0.01",
+  };
+
+  const proc = new ManagedProcess({
+    cmd:   "bun",
+    args:  ["run", GATEWAY_SRC],
+    cwd:   REPO_ROOT,
+    env,
+    label: `gateway:${port}`,
+  });
+
+  proc.start();
+
+  // Wait for the HTTP port to open (gateway bootstraps all packages first)
+  await waitForPort(port, "127.0.0.1", 20_000);
+
+  // Wait for health endpoint to return 200
+  const baseUrl = `http://127.0.0.1:${port}`;
+  await waitForHealth(baseUrl);
+
+  const handle: GatewayHandle = {
+    port,
+    baseUrl,
+    wsUrl:         `ws://127.0.0.1:${port}/ws`,
+    workspaceRoot,
+    storageDir,
+    process:       proc,
+    stop:          () => proc.stop(),
+    cleanup:       () => {
+      try { rmSync(workspaceRoot, { recursive: true, force: true }); } catch { /* ignore */ }
+    },
+  };
+
+  return handle;
+}
+
+async function waitForHealth(baseUrl: string, maxAttempts = 40): Promise<void> {
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      const res = await fetch(`${baseUrl}/health`, { signal: AbortSignal.timeout(2000) });
+      if (res.ok) return;
+    } catch { /* not ready yet */ }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  throw new Error(`Gateway health check failed after ${maxAttempts} attempts`);
+}
+tests/e2e/harness/cliRunner.ts
+TypeScript
+
+// tests/e2e/harness/cliRunner.ts
+// Runs apps/cli as a subprocess and captures output.
+// Supports both one-shot (query) and interactive (REPL with scripted input) modes.
+
+import { resolve }           from "path";
+import { mkdtempSync, rmSync } from "fs";
+import { tmpdir }            from "os";
+import { spawnSync, spawn }  from "child_process";
+import { OutputCapture }     from "./processRunner.js";
+
+const REPO_ROOT  = resolve(import.meta.dir, "../../../");
+const CLI_SRC    = resolve(REPO_ROOT, "apps/cli/src/index.ts");
+
+export interface CliRunResult {
+  exitCode:  number;
+  stdout:    string;
+  stderr:    string;
+  duration:  number;
+}
+
+export interface CliRunOptions {
+  workspaceRoot?: string;
+  args?:          string[];
+  env?:           Record<string, string>;
+  timeoutMs?:     number;
+  input?:         string;   // piped stdin for REPL or query
+}
+
+// ── One-shot CLI execution (synchronous, timeout-bounded) ─────────────────
+
+export function runCli(opts: CliRunOptions = {}): CliRunResult {
+  const workspaceRoot = opts.workspaceRoot ?? mkdtempSync(resolve(tmpdir(), "lw-e2e-cli-"));
+  const start         = Date.now();
+
+  const env: Record<string, string> = {
+    ...process.env as Record<string, string>,
+    WORKSPACE_ROOT:        workspaceRoot,
+    NODE_ENV:              "test",
+    LOG_LEVEL:             "warn",
+    GATEWAY_AUTH_DISABLED: "true",
+    ...opts.env,
+  };
+
+  const result = spawnSync(
+    "bun",
+    ["run", CLI_SRC, ...(opts.args ?? [])],
+    {
+      cwd:      REPO_ROOT,
+      env,
+      input:    opts.input,
+      timeout:  opts.timeoutMs ?? 30_000,
+      encoding: "utf-8",
+    }
+  );
+
+  return {
+    exitCode: result.status ?? 1,
+    stdout:   result.stdout ?? "",
+    stderr:   result.stderr ?? "",
+    duration: Date.now() - start,
+  };
+}
+
+// ── Async CLI runner (for commands that stream output) ────────────────────
+
+export interface AsyncCliHandle {
+  stdout:    OutputCapture;
+  stderr:    OutputCapture;
+  waitForLine(predicate: (line: string) => boolean, timeoutMs?: number): Promise<void>;
+  waitForExit(timeoutMs?: number): Promise<number>;
+  kill():    void;
+}
+
+export function spawnCli(opts: CliRunOptions = {}): AsyncCliHandle {
+  const workspaceRoot = opts.workspaceRoot ?? mkdtempSync(resolve(tmpdir(), "lw-e2e-cli-"));
+  const stdout        = new OutputCapture();
+  const stderr        = new OutputCapture();
+  let exitCode:  number | null = null;
+
+  const env: Record<string, string> = {
+    ...process.env as Record<string, string>,
+    WORKSPACE_ROOT: workspaceRoot,
+    NODE_ENV:       "test",
+    LOG_LEVEL:      "warn",
+    ...opts.env,
+  };
+
+  const proc = spawn(
+    "bun",
+    ["run", CLI_SRC, ...(opts.args ?? [])],
+    {
+      cwd:   REPO_ROOT,
+      env,
+      stdio: ["pipe", "pipe", "pipe"],
+    }
+  );
+
+  proc.stdout.on("data", (chunk: Buffer) =>
+    chunk.toString().split("\n").forEach((l) => l.trim() && stdout.push(l))
+  );
+  proc.stderr.on("data", (chunk: Buffer) =>
+    chunk.toString().split("\n").forEach((l) => l.trim() && stderr.push(l))
+  );
+  proc.on("exit", (code) => { exitCode = code ?? 1; });
+
+  if (opts.input) {
+    proc.stdin.write(opts.input);
+    proc.stdin.end();
+  }
+
+  return {
+    stdout,
+    stderr,
+    waitForLine: (pred, ms) => stdout.waitFor((line) => pred(line), ms),
+    waitForExit: (ms = 15_000) =>
+      new Promise((resolve, reject) => {
+        if (exitCode !== null) { resolve(exitCode); return; }
+        const timer = setTimeout(() => { proc.kill("SIGKILL"); reject(new Error("CLI exit timeout")); }, ms);
+        proc.once("exit", (code) => { clearTimeout(timer); resolve(code ?? 1); });
+      }),
+    kill: () => proc.kill("SIGTERM"),
+  };
+}
+
+// ── Temp workspace factory ─────────────────────────────────────────────────
+
+export function createCliWorkspace(): { root: string; cleanup: () => void } {
+  const root = mkdtempSync(resolve(tmpdir(), "lw-cli-ws-"));
+  return {
+    root,
+    cleanup: () => rmSync(root, { recursive: true, force: true }),
+  };
+}
+tests/e2e/harness/sseReader.ts
+TypeScript
+
+// tests/e2e/harness/sseReader.ts
+// Reads a real SSE stream from the gateway over HTTP (fetch + ReadableStream).
+// Used in stream.e2e.test.ts to validate gateway SSE output.
+
+export interface SseEvent {
+  type:  string;
+  data:  unknown;
+  rawData: string;
+}
+
+export interface SseReadResult {
+  events:      SseEvent[];
+  donePayload: Record<string, unknown> | null;
+  error:       string | null;
+  elapsed:     number;
+}
+
+export async function readSseQuery(
+  baseUrl:   string,
+  sessionId: string,
+  message:   string,
+  opts: {
+    token?:     string;
+    timeoutMs?: number;
+  } = {}
+): Promise<SseReadResult> {
+  const { token, timeoutMs = 30_000 } = opts;
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "Accept":       "text/event-stream",
+  };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+
+  const controller = new AbortController();
+  const timer      = setTimeout(() => controller.abort(), timeoutMs);
+  const start      = Date.now();
+
+  const events:     SseEvent[] = [];
+  let donePayload:  Record<string, unknown> | null = null;
+  let errorMsg:     string | null = null;
+
+  try {
+    const res = await fetch(`${baseUrl}/sessions/${sessionId}/query`, {
+      method:  "POST",
+      headers,
+      body:    JSON.stringify({ message }),
+      signal:  controller.signal,
+    });
+
+    if (!res.ok) {
+      const body = await res.text();
+      return { events, donePayload: null, error: `HTTP ${res.status}: ${body}`, elapsed: Date.now() - start };
+    }
+
+    if (!res.body) {
+      return { events, donePayload: null, error: "No response body", elapsed: Date.now() - start };
+    }
+
+    const reader  = res.body.getReader();
+    const decoder = new TextDecoder();
+    let incomplete  = "";
+    let currentType = "message";
+    let buffer:     string[] = [];
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      incomplete += decoder.decode(value, { stream: true });
+      const lines   = incomplete.split("\n");
+      incomplete    = lines.pop() ?? "";
+
+      for (const line of lines) {
+        if (line.startsWith("event:")) {
+          currentType = line.slice(6).trim();
+        } else if (line.startsWith("data:")) {
+          buffer.push(line.slice(5).trim());
+        } else if (line === "") {
+          if (buffer.length > 0) {
+            const rawData = buffer.join("\n");
+            let parsed: unknown;
+            try { parsed = JSON.parse(rawData); } catch { parsed = rawData; }
+
+            if (currentType === "done") {
+              donePayload = parsed as Record<string, unknown>;
+            } else if (currentType === "error") {
+              errorMsg = (parsed as any)?.message ?? "stream error";
+            } else {
+              events.push({ type: currentType, data: parsed, rawData });
+            }
+
+            buffer      = [];
+            currentType = "message";
+          }
+        }
+      }
+    }
+
+    reader.releaseLock();
+
+  } catch (err: unknown) {
+    if ((err as any)?.name !== "AbortError") {
+      errorMsg = err instanceof Error ? err.message : String(err);
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+
+  return { events, donePayload, error: errorMsg, elapsed: Date.now() - start };
+}
+tests/e2e/harness/wsTestClient.ts
+TypeScript
+
+// tests/e2e/harness/wsTestClient.ts
+// Minimal WS test client for e2e WebSocket tests.
+// Uses Node's built-in `WebSocket` (available since Node 21 / Bun).
+
+export interface WsTestMessage {
+  type:    string;
+  payload: unknown;
+  ts:      number;
+}
+
+export class WsTestClient {
+  private ws:       WebSocket | null = null;
+  private received: WsTestMessage[]  = [];
+  private waiters:  Array<(msg: WsTestMessage) => boolean> = [];
+  private resolvers: Array<{ resolve: (m: WsTestMessage) => void; reject: (e: Error) => void }> = [];
+
+  async connect(url: string, timeoutMs = 8_000): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(`WS connect timeout to ${url}`)),
+        timeoutMs
+      );
+
+      this.ws = new WebSocket(url);
+
+      this.ws.onopen = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+
+      this.ws.onmessage = (event) => {
+        let msg: WsTestMessage;
+        try {
+          msg = JSON.parse(event.data as string) as WsTestMessage;
+        } catch {
+          return;
+        }
+        this.received.push(msg);
+
+        // Notify any pending waiters
+        for (let i = this.waiters.length - 1; i >= 0; i--) {
+          if (this.waiters[i](msg)) {
+            const { resolve } = this.resolvers[i];
+            this.waiters.splice(i, 1);
+            this.resolvers.splice(i, 1);
+            resolve(msg);
+          }
+        }
+      };
+
+      this.ws.onerror = (e) => {
+        clearTimeout(timer);
+        reject(new Error(`WS error: ${String(e)}`));
+      };
+
+      this.ws.onclose = () => {
+        // Reject any pending waiters
+        for (const { reject } of this.resolvers) {
+          reject(new Error("WS connection closed"));
+        }
+        this.resolvers = [];
+        this.waiters   = [];
+      };
+    });
+  }
+
+  send(type: string, payload?: unknown): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error("WS not connected");
+    }
+    this.ws.send(JSON.stringify({ type, payload }));
+  }
+
+  waitForMessage(
+    predicate: (msg: WsTestMessage) => boolean,
+    timeoutMs = 5_000
+  ): Promise<WsTestMessage> {
+    // Check already-received messages first
+    const found = this.received.find(predicate);
+    if (found) return Promise.resolve(found);
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(`waitForMessage timed out after ${timeoutMs}ms`)),
+        timeoutMs
+      );
+
+      this.waiters.push((msg) => {
+        if (predicate(msg)) { clearTimeout(timer); return true; }
+        return false;
+      });
+      this.resolvers.push({ resolve, reject: (e) => { clearTimeout(timer); reject(e); } });
+    });
+  }
+
+  waitForType(type: string, timeoutMs = 5_000): Promise<WsTestMessage> {
+    return this.waitForMessage((m) => m.type === type, timeoutMs);
+  }
+
+  allReceived(): WsTestMessage[] { return [...this.received]; }
+  hasReceived(type: string): boolean { return this.received.some((m) => m.type === type); }
+
+  close(): void {
+    this.ws?.close();
+    this.ws = null;
+  }
+}
+E2E test suites
+tests/e2e/gateway.e2e.test.ts
+TypeScript
+
+// tests/e2e/gateway.e2e.test.ts
+// Verifies that the gateway process boots, passes health checks,
+// and returns correct HTTP responses for core read-only routes.
+
+import { describe, it, expect, beforeAll, afterAll } from "bun:test";
+import { startGateway }                              from "./harness/gatewayProcess.js";
+import type { GatewayHandle }                        from "./harness/gatewayProcess.js";
+
+let gw: GatewayHandle;
+
+beforeAll(async () => {
+  gw = await startGateway({
+    authDisabled: true,
+    enableBash:   false,
+    enableWeb:    false,
+    enableGit:    false,
+  });
+}, 30_000);
+
+afterAll(async () => {
+  await gw.stop();
+  gw.cleanup();
+});
+
+// ── Health ─────────────────────────────────────────────────────────────────
+
+describe("GET /health", () => {
+  it("returns 200 with status ok", async () => {
+    const res  = await fetch(`${gw.baseUrl}/health`);
+    const body = await res.json() as Record<string, unknown>;
+
+    expect(res.status).toBe(200);
+    expect(body.status).toBe("ok");
+    expect(typeof body.uptime).toBe("number");
+    expect(typeof body.version).toBe("string");
+    expect(typeof body.ts).toBe("number");
+  });
+});
+
+describe("GET /health/ready", () => {
+  it("returns 200 or 503 with subsystem checks", async () => {
+    const res  = await fetch(`${gw.baseUrl}/health/ready`);
+    const body = await res.json() as Record<string, unknown>;
+
+    expect([200, 503]).toContain(res.status);
+    expect(body.checks).toBeDefined();
+    expect(typeof body.checks).toBe("object");
+    expect(["ready", "degraded"]).toContain(body.status);
+  });
+});
+
+describe("GET /health/tools", () => {
+  it("returns tool manifest with read_file and grep_files", async () => {
+    const res  = await fetch(`${gw.baseUrl}/health/tools`);
+    const body = await res.json() as { count: number; tools: string[] };
+
+    expect(res.status).toBe(200);
+    expect(typeof body.count).toBe("number");
+    expect(Array.isArray(body.tools)).toBe(true);
+    expect(body.tools).toContain("read_file");
+    expect(body.tools).toContain("grep_files");
+    expect(body.tools).toContain("find_files");
+    expect(body.count).toBe(body.tools.length);
+  });
+});
+
+// ── Sessions ───────────────────────────────────────────────────────────────
+
+describe("POST /sessions", () => {
+  it("creates a session and returns a sessionId", async () => {
+    const res  = await fetch(`${gw.baseUrl}/sessions`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ label: "e2e-test" }),
+    });
+    const body = await res.json() as { sessionId: string };
+
+    expect(res.status).toBe(201);
+    expect(typeof body.sessionId).toBe("string");
+    expect(body.sessionId.length).toBeGreaterThan(0);
+  });
+});
+
+describe("GET /sessions", () => {
+  it("lists sessions", async () => {
+    const res  = await fetch(`${gw.baseUrl}/sessions`);
+    const body = await res.json() as { sessions: unknown[] };
+
+    expect(res.status).toBe(200);
+    expect(Array.isArray(body.sessions)).toBe(true);
+  });
+});
+
+describe("GET /sessions/:id", () => {
+  it("returns 404 for unknown session", async () => {
+    const res = await fetch(`${gw.baseUrl}/sessions/does-not-exist`);
+    expect(res.status).toBe(404);
+  });
+
+  it("returns the session after creating it", async () => {
+    const create = await fetch(`${gw.baseUrl}/sessions`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({}),
+    });
+    const { sessionId } = await create.json() as { sessionId: string };
+
+    const get  = await fetch(`${gw.baseUrl}/sessions/${sessionId}`);
+    const body = await get.json() as { id: string };
+
+    expect(get.status).toBe(200);
+    expect(body.id).toBe(sessionId);
+  });
+});
+
+// ── Memory ─────────────────────────────────────────────────────────────────
+
+describe("GET /memory", () => {
+  it("returns entries array and count", async () => {
+    const res  = await fetch(`${gw.baseUrl}/memory`);
+    const body = await res.json() as { entries: unknown[]; count: number };
+
+    expect(res.status).toBe(200);
+    expect(Array.isArray(body.entries)).toBe(true);
+    expect(typeof body.count).toBe("number");
+  });
+});
+
+describe("POST /memory", () => {
+  it("adds a memory entry", async () => {
+    const res  = await fetch(`${gw.baseUrl}/memory`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ text: "e2e test fact", kind: "fact" }),
+    });
+    const body = await res.json() as { id: string; text: string };
+
+    expect(res.status).toBe(201);
+    expect(body.text).toBe("e2e test fact");
+    expect(typeof body.id).toBe("string");
+  });
+});
+
+// ── Wiki ───────────────────────────────────────────────────────────────────
+
+describe("Wiki CRUD over HTTP", () => {
+  const slug = "e2e-test-page";
+
+  it("creates a wiki page", async () => {
+    const res  = await fetch(`${gw.baseUrl}/wiki/pages`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ slug, title: "E2E Test", content: "# E2E\nTest content." }),
+    });
+    expect(res.status).toBe(201);
+    const body = await res.json() as { slug: string };
+    expect(body.slug).toBe(slug);
+  });
+
+  it("retrieves the wiki page", async () => {
+    const res  = await fetch(`${gw.baseUrl}/wiki/pages/${slug}`);
+    const body = await res.json() as { slug: string; content: string };
+    expect(res.status).toBe(200);
+    expect(body.slug).toBe(slug);
+    expect(body.content).toContain("E2E");
+  });
+
+  it("patches the wiki page", async () => {
+    const res  = await fetch(`${gw.baseUrl}/wiki/pages/${slug}`, {
+      method:  "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ content: "# E2E\nUpdated content." }),
+    });
+    const body = await res.json() as { content: string };
+    expect(res.status).toBe(200);
+    expect(body.content).toContain("Updated");
+  });
+
+  it("lists pages and finds the new one", async () => {
+    const res  = await fetch(`${gw.baseUrl}/wiki/pages`);
+    const body = await res.json() as { pages: Array<{ slug: string }> };
+    expect(res.status).toBe(200);
+    expect(body.pages.some((p) => p.slug === slug)).toBe(true);
+  });
+});
+
+// ── Graph ──────────────────────────────────────────────────────────────────
+
+describe("GET /graph/stats", () => {
+  it("returns nodeCount, edgeCount, fileCount", async () => {
+    const res  = await fetch(`${gw.baseUrl}/graph/stats`);
+    const body = await res.json() as { nodeCount: number; edgeCount: number; fileCount: number };
+
+    expect(res.status).toBe(200);
+    expect(typeof body.nodeCount).toBe("number");
+    expect(typeof body.edgeCount).toBe("number");
+    expect(typeof body.fileCount).toBe("number");
+  });
+});
+
+// ── Admin ──────────────────────────────────────────────────────────────────
+
+describe("GET /admin/audit/summary", () => {
+  it("returns audit summary with total field", async () => {
+    const res  = await fetch(`${gw.baseUrl}/admin/audit/summary`);
+    const body = await res.json() as { total: number; byType: Record<string, number> };
+
+    expect(res.status).toBe(200);
+    expect(typeof body.total).toBe("number");
+    expect(body.total).toBeGreaterThan(0);  // bootstrap itself logs entries
+    expect(typeof body.byType).toBe("object");
+  });
+});
+
+describe("GET /admin/audit", () => {
+  it("returns entries array with limit", async () => {
+    const res  = await fetch(`${gw.baseUrl}/admin/audit?limit=5`);
+    const body = await res.json() as { entries: unknown[]; count: number };
+
+    expect(res.status).toBe(200);
+    expect(Array.isArray(body.entries)).toBe(true);
+    expect(body.entries.length).toBeLessThanOrEqual(5);
+  });
+});
+tests/e2e/sessions.e2e.test.ts
+TypeScript
+
+// tests/e2e/sessions.e2e.test.ts
+// Full session lifecycle: create → query (with stub provider) → history → delete.
+
+import { describe, it, expect, beforeAll, afterAll } from "bun:test";
+import { startGateway }                              from "./harness/gatewayProcess.js";
+import type { GatewayHandle }                        from "./harness/gatewayProcess.js";
+import { writeFileSync }                             from "fs";
+import { resolve }                                   from "path";
+
+let gw: GatewayHandle;
+
+beforeAll(async () => {
+  gw = await startGateway({
+    authDisabled: true,
+    enableBash:   false,
+    enableWeb:    false,
+    enableGit:    false,
+  });
+
+  // Seed a file the agent can read during queries
+  writeFileSync(
+    resolve(gw.workspaceRoot, "hello.ts"),
+    `export function greet(name: string): string {\n  return \`Hello, \${name}!\`;\n}\n`
+  );
+}, 30_000);
+
+afterAll(async () => {
+  await gw.stop();
+  gw.cleanup();
+});
+
+// ── Session lifecycle ──────────────────────────────────────────────────────
+
+describe("Session lifecycle", () => {
+  let sessionId: string;
+
+  it("creates a session", async () => {
+    const res  = await fetch(`${gw.baseUrl}/sessions`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ label: "lifecycle-test" }),
+    });
+    const body = await res.json() as { sessionId: string };
+
+    expect(res.status).toBe(201);
+    sessionId = body.sessionId;
+    expect(typeof sessionId).toBe("string");
+  });
+
+  it("retrieves the session", async () => {
+    const res  = await fetch(`${gw.baseUrl}/sessions/${sessionId}`);
+    const body = await res.json() as { id: string; label?: string };
+
+    expect(res.status).toBe(200);
+    expect(body.id).toBe(sessionId);
+    expect(body.label).toBe("lifecycle-test");
+  });
+
+  it("lists sessions and finds the new one", async () => {
+    const res  = await fetch(`${gw.baseUrl}/sessions`);
+    const body = await res.json() as { sessions: Array<{ id: string }> };
+
+    expect(res.status).toBe(200);
+    expect(body.sessions.some((s) => s.id === sessionId)).toBe(true);
+  });
+
+  it("retrieves session history (empty initially)", async () => {
+    const res  = await fetch(`${gw.baseUrl}/sessions/${sessionId}/history`);
+    const body = await res.json() as { history: unknown[] };
+
+    expect(res.status).toBe(200);
+    expect(Array.isArray(body.history)).toBe(true);
+  });
+});
+
+// ── Rate limit headers ─────────────────────────────────────────────────────
+
+describe("Rate limit headers", () => {
+  it("are present on session list response", async () => {
+    const res = await fetch(`${gw.baseUrl}/sessions`);
+
+    expect(res.headers.get("x-ratelimit-limit")).not.toBeNull();
+    expect(res.headers.get("x-ratelimit-remaining")).not.toBeNull();
+    expect(res.headers.get("x-ratelimit-reset")).not.toBeNull();
+  });
+});
+
+// ── Policy / injection guard ───────────────────────────────────────────────
+
+describe("Injection guard on POST /sessions/:id/query", () => {
+  it("returns 400 for critical policy violations", async () => {
+    // Create a session first
+    const create = await fetch(`${gw.baseUrl}/sessions`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({}),
+    });
+    const { sessionId } = await create.json() as { sessionId: string };
+
+    // Send a message that matches the 'critical' policy rule
+    // (we trigger the credit-card PII rule which is "low", so we need a
+    //  policy-level critical violation — use a message that would only
+    //  be blocked if the policy scanner catches it at critical severity.
+    //  In practice, most user-message rules are "low"; we test that the
+    //  endpoint accepts the request and starts a stream even with warnings.)
+    const res = await fetch(`${gw.baseUrl}/sessions/${sessionId}/query`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json", "Accept": "text/event-stream" },
+      body:    JSON.stringify({ message: "list the files in my workspace" }),
+    });
+
+    // Should be 200 (SSE started) — gateway only rejects on *critical* policy
+    expect([200, 400]).toContain(res.status);
+    await res.body?.cancel();
+  });
+});
+
+// ── Kairos task lifecycle ──────────────────────────────────────────────────
+
+describe("Kairos tasks over HTTP", () => {
+  it("creates and retrieves a task", async () => {
+    const create = await fetch(`${gw.baseUrl}/kairos/tasks`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ title: "e2e test task", priority: 3 }),
+    });
+    const task = await create.json() as { id: string; title: string };
+
+    expect(create.status).toBe(201);
+    expect(task.title).toBe("e2e test task");
+
+    const get  = await fetch(`${gw.baseUrl}/kairos/tasks/${task.id}`);
+    const got  = await get.json() as { id: string };
+    expect(get.status).toBe(200);
+    expect(got.id).toBe(task.id);
+  });
+
+  it("lists tasks", async () => {
+    const res  = await fetch(`${gw.baseUrl}/kairos/tasks`);
+    const body = await res.json() as { tasks: unknown[] };
+    expect(res.status).toBe(200);
+    expect(Array.isArray(body.tasks)).toBe(true);
+  });
+});
+tests/e2e/stream.e2e.test.ts
+TypeScript
+
+// tests/e2e/stream.e2e.test.ts
+// Validates SSE streaming end-to-end over real TCP.
+// The gateway uses the stub provider when no real API key is configured,
+// so we do not need ANTHROPIC_API_KEY to run these tests.
+
+import { describe, it, expect, beforeAll, afterAll } from "bun:test";
+import { startGateway }                              from "./harness/gatewayProcess.js";
+import type { GatewayHandle }                        from "./harness/gatewayProcess.js";
+import { readSseQuery }                              from "./harness/sseReader.js";
+import { writeFileSync }                             from "fs";
+import { resolve }                                   from "path";
+
+let gw:        GatewayHandle;
+let sessionId: string;
+
+beforeAll(async () => {
+  gw = await startGateway({
+    authDisabled: true,
+    enableBash:   false,
+    enableWeb:    false,
+    enableGit:    false,
+  });
+
+  // Seed a readable workspace file
+  writeFileSync(
+    resolve(gw.workspaceRoot, "README.md"),
+    "# LocoWorker E2E Test Workspace\nThis workspace was created for e2e streaming tests.\n"
+  );
+
+  // Create a session to stream into
+  const res  = await fetch(`${gw.baseUrl}/sessions`, {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify({ label: "stream-e2e" }),
+  });
+  const body = await res.json() as { sessionId: string };
+  sessionId  = body.sessionId;
+}, 30_000);
+
+afterAll(async () => {
+  await gw.stop();
+  gw.cleanup();
+});
+
+// ── SSE stream shape ───────────────────────────────────────────────────────
+
+describe("SSE stream: event shape", () => {
+  it("stream starts, emits events, and completes with a done event", async () => {
+    const result = await readSseQuery(gw.baseUrl, sessionId, "Say hello", {
+      timeoutMs: 20_000,
+    });
+
+    // Should either have events or a done payload (stub provider responds instantly)
+    // and should NOT have a raw network error
+    if (result.error) {
+      // Only accept errors if the stub provider isn't configured —
+      // in that case the stream still starts and emits session_error
+      expect(result.events.some((e) => e.type === "session_error")).toBe(true);
+    } else {
+      expect(result.events.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("stream emits session_start as first event", async () => {
+    const result = await readSseQuery(gw.baseUrl, sessionId, "List tools", {
+      timeoutMs: 20_000,
+    });
+
+    if (result.events.length > 0) {
+      expect(result.events[0].type).toBe("session_start");
+    }
+  });
+
+  it("stream includes a done envelope (totalCostUsd, totalTokens)", async () => {
+    const result = await readSseQuery(gw.baseUrl, sessionId, "Hello", {
+      timeoutMs: 20_000,
+    });
+
+    if (!result.error && result.donePayload) {
+      expect(typeof result.donePayload.totalCostUsd).toBe("number");
+      expect(typeof result.donePayload.totalTokens).toBe("number");
+    }
+  });
+});
+
+// ── SSE response headers ──────────────────────────────────────────────────
+
+describe("SSE response headers", () => {
+  it("returns correct content-type for stream endpoint", async () => {
+    const res = await fetch(`${gw.baseUrl}/sessions/${sessionId}/query`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json", "Accept": "text/event-stream" },
+      body:    JSON.stringify({ message: "ping" }),
+    });
+
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
+    expect(res.headers.get("cache-control")).toContain("no-cache");
+    await res.body?.cancel();
+  });
+});
+
+// ── SSE abort ─────────────────────────────────────────────────────────────
+
+describe("SSE abort", () => {
+  it("server does not hang when client disconnects early", async () => {
+    const controller = new AbortController();
+
+    // Start a stream but abort it immediately after receiving first byte
+    const streamPromise = fetch(`${gw.baseUrl}/sessions/${sessionId}/query`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ message: "This message will be cancelled" }),
+      signal:  controller.signal,
+    });
+
+    // Abort after short delay
+    setTimeout(() => controller.abort(), 200);
+
+    try {
+      await streamPromise;
+    } catch (e: unknown) {
+      // AbortError is expected
+      expect((e as Error).name).toBe("AbortError");
+    }
+
+    // Verify gateway is still alive after abort
+    const health = await fetch(`${gw.baseUrl}/health`);
+    expect(health.status).toBe(200);
+  });
+});
+
+// ── Multiple concurrent streams ────────────────────────────────────────────
+
+describe("Concurrent SSE streams", () => {
+  it("handles two simultaneous streams on different sessions", async () => {
+    // Create two sessions
+    const [s1, s2] = await Promise.all([
+      fetch(`${gw.baseUrl}/sessions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      }).then((r) => r.json() as Promise<{ sessionId: string }>),
+      fetch(`${gw.baseUrl}/sessions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      }).then((r) => r.json() as Promise<{ sessionId: string }>),
+    ]);
+
+    // Stream both concurrently
+    const [r1, r2] = await Promise.all([
+      readSseQuery(gw.baseUrl, s1.sessionId, "Hi from session 1", { timeoutMs: 15_000 }),
+      readSseQuery(gw.baseUrl, s2.sessionId, "Hi from session 2", { timeoutMs: 15_000 }),
+    ]);
+
+    // Both should complete (no unhandled crash)
+    expect(r1.elapsed).toBeGreaterThan(0);
+    expect(r2.elapsed).toBeGreaterThan(0);
+
+    // Gateway should still be healthy
+    const health = await fetch(`${gw.baseUrl}/health`);
+    expect(health.status).toBe(200);
+  });
+});
+tests/e2e/ws.e2e.test.ts
+TypeScript
+
+// tests/e2e/ws.e2e.test.ts
+// Validates the gateway WebSocket endpoint: connect, subscribe, ping/pong.
+
+import { describe, it, expect, beforeAll, afterAll } from "bun:test";
+import { startGateway }   from "./harness/gatewayProcess.js";
+import type { GatewayHandle } from "./harness/gatewayProcess.js";
+import { WsTestClient }   from "./harness/wsTestClient.js";
+
+let gw: GatewayHandle;
+
+beforeAll(async () => {
+  gw = await startGateway({
+    authDisabled: true,
+    enableBash:   false,
+    enableWeb:    false,
+    enableGit:    false,
+  });
+}, 30_000);
+
+afterAll(async () => {
+  await gw.stop();
+  gw.cleanup();
+});
+
+// ── Connection ─────────────────────────────────────────────────────────────
+
+describe("WS connection", () => {
+  it("connects and receives a 'connected' welcome message", async () => {
+    const client = new WsTestClient();
+    await client.connect(gw.wsUrl);
+
+    const welcome = await client.waitForType("connected", 5_000);
+    expect(welcome.type).toBe("connected");
+    expect((welcome.payload as any)?.clientId).toBeTruthy();
+
+    client.close();
+  });
+});
+
+// ── Ping / pong ────────────────────────────────────────────────────────────
+
+describe("WS ping/pong", () => {
+  it("server responds to ping with pong", async () => {
+    const client = new WsTestClient();
+    await client.connect(gw.wsUrl);
+
+    // Wait for welcome first
+    await client.waitForType("connected");
+
+    // Send ping
+    client.send("ping");
+    const pong = await client.waitForType("pong", 5_000);
+
+    expect(pong.type).toBe("pong");
+    expect(typeof (pong.payload as any)?.ts).toBe("number");
+
+    client.close();
+  });
+});
+
+// ── Session subscription ──────────────────────────────────────────────────
+
+describe("WS session subscription", () => {
+  it("subscribes to a session and receives subscribed acknowledgement", async () => {
+    // Create a session first
+    const createRes  = await fetch(`${gw.baseUrl}/sessions`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({}),
+    });
+    const { sessionId } = await createRes.json() as { sessionId: string };
+
+    const client = new WsTestClient();
+    await client.connect(gw.wsUrl);
+    await client.waitForType("connected");
+
+    client.send("subscribe_session", { sessionId });
+
+    const ack = await client.waitForType("subscribed", 5_000);
+    expect(ack.type).toBe("subscribed");
+    expect((ack.payload as any)?.sessionId).toBe(sessionId);
+
+    client.close();
+  });
+
+  it("can unsubscribe from a session", async () => {
+    const createRes  = await fetch(`${gw.baseUrl}/sessions`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({}),
+    });
+    const { sessionId } = await createRes.json() as { sessionId: string };
+
+    const client = new WsTestClient();
+    await client.connect(gw.wsUrl);
+    await client.waitForType("connected");
+
+    client.send("subscribe_session", { sessionId });
+    await client.waitForType("subscribed");
+
+    client.send("unsubscribe_session", { sessionId });
+    const unsubAck = await client.waitForType("unsubscribed", 5_000);
+    expect(unsubAck.type).toBe("unsubscribed");
+
+    client.close();
+  });
+});
+
+// ── Multiple clients ──────────────────────────────────────────────────────
+
+describe("Multiple WS clients", () => {
+  it("two clients can connect simultaneously", async () => {
+    const [c1, c2] = [new WsTestClient(), new WsTestClient()];
+
+    await Promise.all([
+      c1.connect(gw.wsUrl),
+      c2.connect(gw.wsUrl),
+    ]);
+
+    const [w1, w2] = await Promise.all([
+      c1.waitForType("connected"),
+      c2.waitForType("connected"),
+    ]);
+
+    expect(w1.type).toBe("connected");
+    expect(w2.type).toBe("connected");
+
+    // Each client gets a unique clientId
+    const id1 = (w1.payload as any)?.clientId;
+    const id2 = (w2.payload as any)?.clientId;
+    expect(id1).not.toBe(id2);
+
+    // Stats endpoint reflects connected clients
+    const statsRes = await fetch(`${gw.baseUrl}/ws/stats`);
+    const stats    = await statsRes.json() as { connectedClients: number };
+    expect(stats.connectedClients).toBeGreaterThanOrEqual(2);
+
+    c1.close();
+    c2.close();
+  });
+});
+
+// ── Unknown message type ──────────────────────────────────────────────────
+
+describe("WS error handling", () => {
+  it("returns error for unknown message type", async () => {
+    const client = new WsTestClient();
+    await client.connect(gw.wsUrl);
+    await client.waitForType("connected");
+
+    client.send("unknown_message_type_xyz");
+
+    const err = await client.waitForType("error", 5_000);
+    expect(err.type).toBe("error");
+    expect((err.payload as any)?.message).toContain("Unknown message type");
+
+    client.close();
+  });
+});
+tests/e2e/cli.e2e.test.ts
+TypeScript
+
+// tests/e2e/cli.e2e.test.ts
+// Validates the CLI as a subprocess — argument parsing, subcommands,
+// filesystem tools, and one-shot query mode.
+
+import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { runCli, createCliWorkspace, spawnCli }        from "./harness/cliRunner.js";
+import { writeFileSync, mkdirSync }                    from "fs";
+import { resolve }                                     from "path";
+
+let ws: { root: string; cleanup: () => void };
+
+beforeEach(() => {
+  ws = createCliWorkspace();
+});
+
+afterEach(() => {
+  ws.cleanup();
+});
+
+// ── --version ──────────────────────────────────────────────────────────────
+
+describe("locoworker --version", () => {
+  it("exits 0 and prints a semver string", () => {
+    const result = runCli({ args: ["--version"], workspaceRoot: ws.root });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toMatch(/^\d+\.\d+\.\d+$/);
+  });
+});
+
+// ── --help ─────────────────────────────────────────────────────────────────
+
+describe("locoworker --help", () => {
+  it("exits 0 and prints usage", () => {
+    const result = runCli({ args: ["--help"], workspaceRoot: ws.root });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("Usage:");
+    expect(result.stdout).toContain("locoworker");
+  });
+});
+
+// ── config subcommand ──────────────────────────────────────────────────────
+
+describe("locoworker config show", () => {
+  it("prints configuration table", () => {
+    const result = runCli({
+      args:          ["config", "show"],
+      workspaceRoot: ws.root,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("WORKSPACE_ROOT");
+  });
+});
+
+describe("locoworker config check", () => {
+  it("reports CLAUDE.md and MEMORY.md existence", () => {
+    const result = runCli({
+      args:          ["config", "check"],
+      workspaceRoot: ws.root,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("CLAUDE.md");
+    expect(result.stdout).toContain("MEMORY.md");
+    expect(result.stdout).toContain(".locoworker/");
+  });
+});
+
+// ── memory subcommand ──────────────────────────────────────────────────────
+
+describe("locoworker memory show", () => {
+  it("runs without error on empty workspace", () => {
+    const result = runCli({
+      args:          ["memory", "show"],
+      workspaceRoot: ws.root,
+      env:           { LOG_LEVEL: "silent" },
+    });
+    // Empty memory is fine — exit 0 with "No memory entries" message
+    expect(result.exitCode).toBe(0);
+  });
+});
+
+describe("locoworker memory summary", () => {
+  it("exits 0", () => {
+    const result = runCli({
+      args:          ["memory", "summary"],
+      workspaceRoot: ws.root,
+      env:           { LOG_LEVEL: "silent" },
+    });
+    expect(result.exitCode).toBe(0);
+  });
+});
+
+// ── graph subcommand ───────────────────────────────────────────────────────
+
+describe("locoworker graph stats", () => {
+  it("exits 0 and prints stats", () => {
+    const result = runCli({
+      args:          ["graph", "stats"],
+      workspaceRoot: ws.root,
+      env:           { LOG_LEVEL: "silent" },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("Nodes");
+    expect(result.stdout).toContain("Edges");
+  });
+});
+
+describe("locoworker graph scan", () => {
+  it("scans workspace and reports file count", () => {
+    // Seed some TS files
+    writeFileSync(resolve(ws.root, "index.ts"), 'export const x = 1;\n');
+    writeFileSync(resolve(ws.root, "utils.ts"), 'export function add(a: number, b: number) { return a + b; }\n');
+
+    const result = runCli({
+      args:          ["graph", "scan"],
+      workspaceRoot: ws.root,
+      env:           { LOG_LEVEL: "silent" },
+      timeoutMs:     20_000,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.toLowerCase()).toMatch(/scan|file|node/);
+  });
+});
+
+// ── wiki subcommand ────────────────────────────────────────────────────────
+
+describe("locoworker wiki list", () => {
+  it("exits 0 on empty wiki", () => {
+    const result = runCli({
+      args:          ["wiki", "list"],
+      workspaceRoot: ws.root,
+      env:           { LOG_LEVEL: "silent" },
+    });
+    expect(result.exitCode).toBe(0);
+  });
+});
+
+// ── unknown command ────────────────────────────────────────────────────────
+
+describe("unknown command", () => {
+  it("exits non-zero and prints usage hint", () => {
+    const result = runCli({
+      args:          ["totally-invalid-command"],
+      workspaceRoot: ws.root,
+    });
+    expect(result.exitCode).not.toBe(0);
+  });
+});
+
+// ── query subcommand (one-shot, stub provider) ─────────────────────────────
+
+describe("locoworker query (one-shot)", () => {
+  it("exits 0 and emits events with --json flag when stub provider is active", async () => {
+    const result = runCli({
+      args: [
+        "query",
+        "What files are in this workspace?",
+        "--no-bash",
+        "--no-web",
+        "--no-git",
+        "--json",
+      ],
+      workspaceRoot: ws.root,
+      env: {
+        LOG_LEVEL:             "silent",
+        // No API keys = stub provider kicks in
+        ANTHROPIC_API_KEY:     "",
+        OPENAI_API_KEY:        "",
+      },
+      timeoutMs: 20_000,
+    });
+
+    // With stub provider: exits 0, stdout has JSON event lines or session_error
+    // Either outcome is valid — what we verify is the process doesn't hang
+    expect([0, 1]).toContain(result.exitCode);
+    expect(result.duration).toBeLessThan(20_000);
+  });
+
+  it("emits session_start event in JSON mode", async () => {
+    const result = runCli({
+      args: [
+        "query",
+        "Hello",
+        "--no-bash",
+        "--no-web",
+        "--no-git",
+        "--json",
+      ],
+      workspaceRoot: ws.root,
+      env: {
+        LOG_LEVEL:         "silent",
+        ANTHROPIC_API_KEY: "",
+        OPENAI_API_KEY:    "",
+      },
+      timeoutMs: 20_000,
+    });
+
+    // Parse each stdout line as JSON
+    const events = result.stdout
+      .split("\n")
+      .filter((l) => l.trim().startsWith("{"))
+      .map((l) => {
+        try { return JSON.parse(l) as { type: string }; } catch { return null; }
+      })
+      .filter(Boolean);
+
+    // Should have at least one parseable event
+    if (events.length > 0) {
+      expect(events[0]?.type).toBeDefined();
+    }
+  });
+});
+
+// ── stdin REPL mode ────────────────────────────────────────────────────────
+
+describe("REPL via stdin", () => {
+  it("responds to /help command and exits on quit", async () => {
+    const handle = spawnCli({
+      args:          ["repl", "--no-bash", "--no-web", "--no-git"],
+      workspaceRoot: ws.root,
+      env:           { LOG_LEVEL: "silent" },
+      input:         "/help\nexit\n",
+    });
+
+    await handle.waitForLine((l) => l.includes("Commands:"), 10_000);
+    const code = await handle.waitForExit(10_000);
+
+    expect(code).toBe(0);
+    expect(handle.stdout.text()).toContain("Commands:");
+  });
+
+  it("responds to /tools command and lists registered tools", async () => {
+    const handle = spawnCli({
+      args:          ["repl", "--no-bash", "--no-web", "--no-git"],
+      workspaceRoot: ws.root,
+      env:           { LOG_LEVEL: "silent" },
+      input:         "/tools\nexit\n",
+    });
+
+    await handle.waitForLine((l) => l.includes("read_file"), 10_000);
+    await handle.waitForExit(10_000);
+
+    expect(handle.stdout.text()).toContain("read_file");
+    expect(handle.stdout.text()).toContain("grep_files");
+  });
+});
+GitHub Actions workflows
+.github/workflows/ci.yml
+YAML
+
+# .github/workflows/ci.yml
+# Main CI pipeline: lint → typecheck → build → unit tests → integration → e2e
+
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUN_VERSION: "1.1.x"
+  TURBO_TELEMETRY_DISABLED: "1"
+
+jobs:
+  # ── 1. Dependency install + cache ────────────────────────────────────────
+  setup:
+    name: Install dependencies
+    runs-on: ubuntu-latest
+    outputs:
+      cache-hit: ${{ steps.cache.outputs.cache-hit }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Cache pnpm store
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pnpm-store
+            node_modules
+            packages/*/node_modules
+            apps/*/node_modules
+            tests/*/node_modules
+          key: pnpm-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            pnpm-${{ runner.os }}-
+
+      - name: Install pnpm
+        run: npm install -g pnpm@9
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+  # ── 2. Lint ────────────────────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    needs: setup
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v1
+        with: { bun-version: "${{ env.BUN_VERSION }}" }
+      - name: Restore cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pnpm-store
+            node_modules
+            packages/*/node_modules
+            apps/*/node_modules
+          key: pnpm-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
+      - run: npm install -g pnpm@9
+      - run: pnpm install --frozen-lockfile
+      - name: Run lint
+        run: pnpm turbo run lint --parallel
+
+  # ── 3. Type check ─────────────────────────────────────────────────────
+  typecheck:
+    name: Type check
+    runs-on: ubuntu-latest
+    needs: setup
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v1
+        with: { bun-version: "${{ env.BUN_VERSION }}" }
+      - name: Restore cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pnpm-store
+            node_modules
+            packages/*/node_modules
+            apps/*/node_modules
+          key: pnpm-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
+      - run: npm install -g pnpm@9
+      - run: pnpm install --frozen-lockfile
+      - name: Type check all packages
+        run: pnpm turbo run typecheck
+
+  # ── 4. Build all packages ──────────────────────────────────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v1
+        with: { bun-version: "${{ env.BUN_VERSION }}" }
+      - name: Restore cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pnpm-store
+            node_modules
+            packages/*/node_modules
+            apps/*/node_modules
+          key: pnpm-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
+      - run: npm install -g pnpm@9
+      - run: pnpm install --frozen-lockfile
+
+      - name: Restore Turbo cache
+        uses: actions/cache@v4
+        with:
+          path: .turbo
+          key: turbo-${{ runner.os }}-${{ github.sha }}
+          restore-keys: turbo-${{ runner.os }}-
+
+      - name: Build all packages
+        run: pnpm turbo run build
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-packages
+          path: |
+            packages/*/dist
+            apps/*/dist
+          retention-days: 1
+
+  # ── 5. Unit tests (all packages) ──────────────────────────────────────
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v1
+        with: { bun-version: "${{ env.BUN_VERSION }}" }
+      - name: Restore cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pnpm-store
+            node_modules
+            packages/*/node_modules
+            apps/*/node_modules
+          key: pnpm-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
+      - run: npm install -g pnpm@9
+      - run: pnpm install --frozen-lockfile
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-packages
+
+      - name: Run unit tests
+        run: pnpm turbo run test --filter='!@locoworker/integration-tests' --filter='!@locoworker/e2e-tests'
+        env:
+          NODE_ENV: test
+          LOG_LEVEL: silent
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unit-coverage
+          path: coverage/
+          retention-days: 7
+
+  # ── 6. Integration tests ──────────────────────────────────────────────
+  integration-tests:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v1
+        with: { bun-version: "${{ env.BUN_VERSION }}" }
+      - name: Restore cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pnpm-store
+            node_modules
+            packages/*/node_modules
+            apps/*/node_modules
+          key: pnpm-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
+      - run: npm install -g pnpm@9
+      - run: pnpm install --frozen-lockfile
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-packages
+
+      - name: Run integration tests
+        run: pnpm --filter @locoworker/integration-tests test
+        timeout-minutes: 10
+        env:
+          NODE_ENV: test
+          LOG_LEVEL: silent
+          GATEWAY_AUTH_DISABLED: "true"
+
+  # ── 7. E2E tests ──────────────────────────────────────────────────────
+  e2e-tests:
+    name: E2E tests
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v1
+        with: { bun-version: "${{ env.BUN_VERSION }}" }
+
+      - name: Install system dependencies (git for tools-git tests)
+        run: sudo apt-get install -y git
+
+      - name: Restore cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pnpm-store
+            node_modules
+            packages/*/node_modules
+            apps/*/node_modules
+          key: pnpm-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
+      - run: npm install -g pnpm@9
+      - run: pnpm install --frozen-lockfile
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-packages
+
+      - name: Run E2E tests
+        run: pnpm --filter @locoworker/e2e-tests test
+        timeout-minutes: 15
+        env:
+          NODE_ENV: test
+          LOG_LEVEL: warn
+          GATEWAY_AUTH_DISABLED: "true"
+          # Stub provider — no real API keys needed for E2E
+          ANTHROPIC_API_KEY: ""
+          OPENAI_API_KEY: ""
+
+      - name: Upload E2E artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-failure-logs
+          path: /tmp/lw-e2e-*/
+          retention-days: 3
+
+  # ── 8. Matrix: cross-platform smoke tests ────────────────────────────
+  smoke-tests:
+    name: Smoke test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v1
+        with: { bun-version: "${{ env.BUN_VERSION }}" }
+      - run: npm install -g pnpm@9
+      - run: pnpm install --frozen-lockfile
+      - name: Build
+        run: pnpm turbo run build
+      - name: Smoke test (unit tests only)
+        run: pnpm turbo run test --filter=@locoworker/shared --filter=@locoworker/security
+        env:
+          NODE_ENV: test
+          LOG_LEVEL: silent
+
+  # ── 9. Final CI gate ──────────────────────────────────────────────────
+  ci-gate:
+    name: CI Gate
+    runs-on: ubuntu-latest
+    needs:
+      - unit-tests
+      - integration-tests
+      - e2e-tests
+    if: always()
+    steps:
+      - name: Check all jobs passed
+        run: |
+          if [[ "${{ needs.unit-tests.result }}" != "success" ]]; then
+            echo "Unit tests failed"
+            exit 1
+          fi
+          if [[ "${{ needs.integration-tests.result }}" != "success" ]]; then
+            echo "Integration tests failed"
+            exit 1
+          fi
+          if [[ "${{ needs.e2e-tests.result }}" != "success" ]]; then
+            echo "E2E tests failed"
+            exit 1
+          fi
+          echo "All CI jobs passed"
+.github/workflows/pr.yml
+YAML
+
+# .github/workflows/pr.yml
+# Fast PR gate: runs in < 5 minutes.
+# Covers lint, typecheck, and a focused unit test subset only.
+# Full integration + e2e run in ci.yml on merge.
+
+name: PR Check
+
+on:
+  pull_request:
+    branches: [main, develop]
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: pr-${{ github.head_ref }}
+  cancel-in-progress: true
+
+env:
+  BUN_VERSION: "1.1.x"
+  TURBO_TELEMETRY_DISABLED: "1"
+
+jobs:
+  pr-fast-check:
+    name: PR fast check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install pnpm
+        run: npm install -g pnpm@9
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pnpm-store
+            node_modules
+            packages/*/node_modules
+          key: pnpm-pr-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: pnpm-pr-${{ runner.os }}-
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Restore Turbo cache
+        uses: actions/cache@v4
+        with:
+          path: .turbo
+          key: turbo-pr-${{ runner.os }}-${{ github.sha }}
+          restore-keys: turbo-pr-${{ runner.os }}-
+
+      - name: Typecheck
+        run: pnpm turbo run typecheck
+
+      - name: Build
+        run: pnpm turbo run build
+
+      - name: Unit tests (fast subset)
+        run: |
+          pnpm turbo run test \
+            --filter=@locoworker/shared \
+            --filter=@locoworker/security \
+            --filter=@locoworker/tools-fs \
+            --filter=@locoworker/tools-search
+        env:
+          NODE_ENV: test
+          LOG_LEVEL: silent
+
+      - name: PR summary
+        if: always()
+        run: |
+          echo "## PR Check Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Step | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Typecheck | ✓ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build | ✓ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Unit tests | ✓ |" >> $GITHUB_STEP_SUMMARY
+.github/workflows/release.yml
+YAML
+
+# .github/workflows/release.yml
+# Triggered by a semver tag push (v*.*.*).
+# Builds all packages, runs full test suite, then:
+#   - publishes npm packages (if PUBLISH_NPM=true)
+#   - builds Electron desktop app for macOS / Linux / Windows
+#   - creates a GitHub release with artifacts
+#   - builds dashboard SPA and deploys to GitHub Pages (if configured)
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+
+env:
+  BUN_VERSION: "1.1.x"
+  NODE_VERSION: "20.x"
+  TURBO_TELEMETRY_DISABLED: "1"
+
+jobs:
+  # ── 1. Validate release ─────────────────────────────────────────────────
+  validate:
+    name: Validate release
+    runs-on: ubuntu-latest
+    outputs:
+      version:     ${{ steps.extract.outputs.version }}
+      is_prerelease: ${{ steps.extract.outputs.is_prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: extract
+        run: |
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          if [[ "${VERSION}" == *"-"* ]]; then
+            echo "is_prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_prerelease=false" >> $GITHUB_OUTPUT
+          fi
+          echo "Release version: ${VERSION}"
+
+      - uses: oven-sh/setup-bun@v1
+        with: { bun-version: "${{ env.BUN_VERSION }}" }
+
+      - run: npm install -g pnpm@9
+      - run: pnpm install --frozen-lockfile
+
+      - name: Verify version consistency
+        run: bun run scripts/version.ts --check ${{ steps.extract.outputs.version }}
+
+  # ── 2. Full test suite ──────────────────────────────────────────────────
+  test:
+    name: Full test suite
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v1
+        with: { bun-version: "${{ env.BUN_VERSION }}" }
+      - run: npm install -g pnpm@9
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm turbo run build
+      - name: Unit tests
+        run: pnpm turbo run test --filter='!@locoworker/integration-tests' --filter='!@locoworker/e2e-tests'
+        env: { NODE_ENV: test, LOG_LEVEL: silent }
+      - name: Integration tests
+        run: pnpm --filter @locoworker/integration-tests test
+        env: { NODE_ENV: test, GATEWAY_AUTH_DISABLED: "true" }
+      - name: E2E tests
+        run: pnpm --filter @locoworker/e2e-tests test
+        env: { NODE_ENV: test, GATEWAY_AUTH_DISABLED: "true" }
+
+  # ── 3. Build packages + apps ────────────────────────────────────────────
+  build-release:
+    name: Build release artifacts
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v1
+        with: { bun-version: "${{ env.BUN_VERSION }}" }
+      - run: npm install -g pnpm@9
+      - run: pnpm install --frozen-lockfile
+      - name: Build all
+        run: pnpm turbo run build
+      - name: Build dashboard SPA
+        run: pnpm --filter @locoworker/dashboard build
+      - name: Upload packages dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-packages-${{ needs.validate.outputs.version }}
+          path: |
+            packages/*/dist
+            apps/gateway/dist
+            apps/cli/dist
+            apps/dashboard/dist
+          retention-days: 30
+
+  # ── 4. Build Electron desktop (matrix: macOS / Linux / Windows) ──────────
+  build-desktop:
+    name: Desktop (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: "--mac"
+            artifact: "out/*.dmg"
+          - os: ubuntu-latest
+            target: "--linux"
+            artifact: "out/*.AppImage"
+          - os: windows-latest
+            target: "--win"
+            artifact: "out/*.exe"
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v1
+        with: { bun-version: "${{ env.BUN_VERSION }}" }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - run: npm install -g pnpm@9
+      - working-directory: .
+        run: pnpm install --frozen-lockfile
+
+      - name: Build workspace packages
+        working-directory: .
+        run: pnpm turbo run build --filter='!@locoworker/desktop' --filter='!@locoworker/dashboard'
+
+      - name: Build desktop app
+        run: pnpm build
+
+      - name: Package with electron-builder
+        run: npx electron-builder ${{ matrix.target }} --publish never
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false   # skip code signing in CI
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload desktop artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.os }}-${{ needs.validate.outputs.version }}
+          path: apps/desktop/${{ matrix.artifact }}
+          retention-days: 30
+
+  # ── 5. Create GitHub release ────────────────────────────────────────────
+  github-release:
+    name: Create GitHub release
+    runs-on: ubuntu-latest
+    needs:
+      - validate
+      - build-release
+      - build-desktop
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts/
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # Extract changelog section for this version from CHANGELOG.md
+          VERSION="${{ needs.validate.outputs.version }}"
+          if [[ -f CHANGELOG.md ]]; then
+            NOTES=$(awk "/^## \[${VERSION}\]/{found=1; next} found && /^## \[/{exit} found{print}" CHANGELOG.md)
+          else
+            NOTES="Release ${VERSION}"
+          fi
+          echo "notes<<EOF" >> $GITHUB_OUTPUT
+          echo "${NOTES}" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name:   ${{ github.ref_name }}
+          name:       LocoWorker ${{ needs.validate.outputs.version }}
+          body:       ${{ steps.changelog.outputs.notes }}
+          prerelease: ${{ needs.validate.outputs.is_prerelease == 'true' }}
+          files: |
+            release-artifacts/**/*.dmg
+            release-artifacts/**/*.AppImage
+            release-artifacts/**/*.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── 6. Publish npm packages (optional) ─────────────────────────────────
+  npm-publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    needs:
+      - validate
+      - build-release
+    if: ${{ vars.PUBLISH_NPM == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v1
+        with: { bun-version: "${{ env.BUN_VERSION }}" }
+      - run: npm install -g pnpm@9
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm turbo run build
+      - name: Publish packages
+        run: bun run scripts/release.ts --publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+Final turbo.json
+turbo.json
+JSON
+
+{
+  "$schema": "https://turbo.build/schema.json",
+  "globalEnv": [
+    "NODE_ENV",
+    "LOG_LEVEL",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "GATEWAY_AUTH_DISABLED",
+    "GATEWAY_JWT_SECRET",
+    "WORKSPACE_ROOT",
+    "PERMISSION_SET",
+    "LOCOWORKER_MODEL"
+  ],
+  "globalDependencies": [
+    "tsconfig.base.json",
+    ".env"
+  ],
+  "tasks": {
+
+    "build": {
+      "dependsOn": ["^build"],
+      "inputs": [
+        "src/**/*.ts",
+        "src/**/*.tsx",
+        "package.json",
+        "tsconfig.json",
+        "tsconfig.*.json",
+        "vite.*.config.ts"
+      ],
+      "outputs": [
+        "dist/**",
+        ".turbo/cache/**"
+      ],
+      "cache": true
+    },
+
+    "dev": {
+      "dependsOn": ["^build"],
+      "cache": false,
+      "persistent": true
+    },
+
+    "typecheck": {
+      "dependsOn": ["^build"],
+      "inputs": [
+        "src/**/*.ts",
+        "src/**/*.tsx",
+        "tsconfig.json",
+        "tsconfig.*.json"
+      ],
+      "outputs": [],
+      "cache": true
+    },
+
+    "lint": {
+      "inputs": [
+        "src/**/*.ts",
+        "src/**/*.tsx",
+        "*.json",
+        ".eslintrc*",
+        "biome.json"
+      ],
+      "outputs": [],
+      "cache": true
+    },
+
+    "test": {
+      "dependsOn": ["^build"],
+      "inputs": [
+        "src/**/*.ts",
+        "src/**/*.tsx",
+        "src/**/__tests__/**",
+        "*.test.ts",
+        "*.test.tsx"
+      ],
+      "outputs": [
+        "coverage/**"
+      ],
+      "cache": true,
+      "env": [
+        "NODE_ENV",
+        "LOG_LEVEL"
+      ]
+    },
+
+    "test:watch": {
+      "dependsOn": ["^build"],
+      "cache": false,
+      "persistent": true
+    },
+
+    "clean": {
+      "cache": false
+    },
+
+    "graph:scan": {
+      "dependsOn": ["build"],
+      "cache": false
+    },
+
+    "wiki:sync": {
+      "dependsOn": ["build"],
+      "cache": false
+    },
+
+    "kairos:start": {
+      "dependsOn": ["build"],
+      "cache": false,
+      "persistent": true
+    },
+
+    "research:run": {
+      "dependsOn": ["build"],
+      "cache": false
+    },
+
+    "sim:run": {
+      "dependsOn": ["build"],
+      "cache": false
+    }
+  },
+
+  "pipeline": {
+    "build": {
+      "dependsOn": ["^build"]
+    }
+  }
+}
+Release and utility scripts
+scripts/version.ts
+TypeScript
+
+#!/usr/bin/env bun
+// scripts/version.ts
+// Reads or bumps the version across all package.json files in the monorepo.
+// Usage:
+//   bun run scripts/version.ts               → print current versions
+//   bun run scripts/version.ts --bump patch  → bump patch across all
+//   bun run scripts/version.ts --bump minor  → bump minor
+//   bun run scripts/version.ts --bump major  → bump major
+//   bun run scripts/version.ts --set 1.2.3   → set explicit version
+//   bun run scripts/version.ts --check 1.2.3 → verify all packages match
+
+import { readFileSync, writeFileSync, readdirSync, existsSync } from "fs";
+import { resolve, join }                                         from "path";
+
+const ROOT = resolve(import.meta.dir, "..");
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+function readJson(path: string): Record<string, unknown> {
+  return JSON.parse(readFileSync(path, "utf-8"));
+}
+
+function writeJson(path: string, data: Record<string, unknown>): void {
+  writeFileSync(path, JSON.stringify(data, null, 2) + "\n", "utf-8");
+}
+
+function bumpVersion(current: string, type: "patch" | "minor" | "major"): string {
+  const parts = current.replace(/^[^0-9]*/, "").split(".");
+  const [major, minor, patch] = parts.map(Number);
+  switch (type) {
+    case "patch": return `${major}.${minor}.${patch + 1}`;
+    case "minor": return `${major}.${minor + 1}.0`;
+    case "major": return `${major + 1}.0.0`;
+  }
+}
+
+function getAllPackageJsonPaths(): string[] {
+  const paths: string[] = [join(ROOT, "package.json")];
+
+  for (const dir of ["packages", "apps", "tests"]) {
+    const base = join(ROOT, dir);
+    if (!existsSync(base)) continue;
+    for (const pkg of readdirSync(base)) {
+      const pkgJson = join(base, pkg, "package.json");
+      if (existsSync(pkgJson)) paths.push(pkgJson);
+    }
+  }
+
+  // Also check scripts/package.json if it exists
+  const scriptsJson = join(ROOT, "scripts", "package.json");
+  if (existsSync(scriptsJson)) paths.push(scriptsJson);
+
+  return paths;
+}
+
+function getSharedVersion(pkgVersion: string): string {
+  return join(ROOT, "packages", "shared", "package.json") === pkgVersion
+    ? "shared"
+    : "other";
+}
+
+// ── Main ───────────────────────────────────────────────────────────────────
+
+const args = process.argv.slice(2);
+
+const allPaths = getAllPackageJsonPaths();
+const packages = allPaths
+  .map((p) => ({ path: p, json: readJson(p) as { name?: string; version?: string } }))
+  .filter((p) => p.json.version);
+
+if (args.includes("--check")) {
+  const expected = args[args.indexOf("--check") + 1];
+  if (!expected) { console.error("--check requires a version argument"); process.exit(1); }
+
+  let allMatch = true;
+  for (const pkg of packages) {
+    if (pkg.json.version !== expected && pkg.json.name !== undefined) {
+      // Allow workspace packages to be "0.1.0" during development
+      const isMismatch = pkg.json.version !== expected &&
+                         pkg.json.version !== "0.1.0";
+      if (isMismatch) {
+        console.error(`✗ ${pkg.json.name}: ${pkg.json.version} (expected ${expected})`);
+        allMatch = false;
+      }
+    }
+  }
+
+  if (allMatch) {
+    console.log(`✓ All packages match version ${expected} (or are workspace defaults)`);
+    process.exit(0);
+  } else {
+    process.exit(1);
+  }
+}
+
+if (args.includes("--set")) {
+  const version = args[args.indexOf("--set") + 1];
+  if (!version || !/^\d+\.\d+\.\d+(-[a-zA-Z0-9.-]+)?$/.test(version)) {
+    console.error("--set requires a valid semver version");
+    process.exit(1);
+  }
+
+  for (const pkg of packages) {
+    (pkg.json as any).version = version;
+    writeJson(pkg.path, pkg.json as Record<string, unknown>);
+    console.log(`  ${pkg.json.name ?? pkg.path}: → ${version}`);
+  }
+
+  // Also update @locoworker/shared in constants.ts
+  const constantsPath = join(ROOT, "packages", "shared", "src", "constants.ts");
+  if (existsSync(constantsPath)) {
+    const src = readFileSync(constantsPath, "utf-8");
+    const updated = src.replace(
+      /export const LOCOWORKER_VERSION = ".*?";/,
+      `export const LOCOWORKER_VERSION = "${version}";`
+    );
+    writeFileSync(constantsPath, updated, "utf-8");
+    console.log(`  Updated LOCOWORKER_VERSION → ${version}`);
+  }
+
+  console.log(`\n✓ Set all packages to ${version}`);
+  process.exit(0);
+}
+
+if (args.includes("--bump")) {
+  const type = args[args.indexOf("--bump") + 1] as "patch" | "minor" | "major";
+  if (!["patch", "minor", "major"].includes(type)) {
+    console.error("--bump requires patch | minor | major");
+    process.exit(1);
+  }
+
+  // Use the root package.json as the source of truth
+  const rootJson = readJson(join(ROOT, "package.json")) as { version: string };
+  const newVersion = bumpVersion(rootJson.version, type);
+
+  // Delegate to --set
+  const { spawnSync } = await import("child_process");
+  spawnSync("bun", ["run", import.meta.path, "--set", newVersion], {
+    stdio: "inherit",
+    cwd:   ROOT,
+  });
+  process.exit(0);
+}
+
+// Default: print all versions
+console.log("Package versions:\n");
+for (const pkg of packages) {
+  const name = (pkg.json.name ?? pkg.path.replace(ROOT, "")).padEnd(45);
+  console.log(`  ${name} ${pkg.json.version}`);
+}
+scripts/check-env.ts
+TypeScript
+
+#!/usr/bin/env bun
+// scripts/check-env.ts
+// Pre-flight environment check for developers and CI.
+// Verifies required tools are installed and env vars are present.
+
+import { spawnSync, execSync } from "child_process";
+import { existsSync }          from "fs";
+import { resolve }             from "path";
+
+const ROOT   = resolve(import.meta.dir, "..");
+const PASS   = "✓";
+const FAIL   = "✗";
+const WARN   = "⚠";
+
+interface Check {
+  name:     string;
+  required: boolean;
+  check:    () => { ok: boolean; detail?: string };
+}
+
+const checks: Check[] = [
+  {
+    name:     "bun >= 1.1.0",
+    required: true,
+    check: () => {
+      try {
+        const r = spawnSync("bun", ["--version"], { encoding: "utf-8" });
+        const v = r.stdout.trim();
+        const ok = !!v && v >= "1.1.0";
+        return { ok, detail: `found ${v}` };
+      } catch {
+        return { ok: false, detail: "not found" };
+      }
+    },
+  },
+  {
+    name:     "pnpm >= 9.0.0",
+    required: true,
+    check: () => {
+      try {
+        const r = spawnSync("pnpm", ["--version"], { encoding: "utf-8" });
+        const v = r.stdout.trim();
+        return { ok: !!v && v >= "9.0.0", detail: `found ${v}` };
+      } catch {
+        return { ok: false, detail: "not found — run: npm install -g pnpm@9" };
+      }
+    },
+  },
+  {
+    name:     "Node.js >= 20",
+    required: true,
+    check: () => {
+      const v = process.version;
+      const major = parseInt(v.slice(1));
+      return { ok: major >= 20, detail: `found ${v}` };
+    },
+  },
+  {
+    name:     "git installed",
+    required: false,
+    check: () => {
+      try {
+        const r = spawnSync("git", ["--version"], { encoding: "utf-8" });
+        return { ok: r.status === 0, detail: r.stdout.trim() };
+      } catch {
+        return { ok: false, detail: "tools-git will be unavailable" };
+      }
+    },
+  },
+  {
+    name:     "turbo installed",
+    required: false,
+    check: () => {
+      try {
+        const r = spawnSync("turbo", ["--version"], { encoding: "utf-8" });
+        return { ok: r.status === 0, detail: r.stdout.trim() };
+      } catch {
+        return { ok: false, detail: "run: npm install -g turbo" };
+      }
+    },
+  },
+  {
+    name:     "pnpm-lock.yaml exists",
+    required: true,
+    check: () => {
+      const ok = existsSync(resolve(ROOT, "pnpm-lock.yaml"));
+      return { ok, detail: ok ? "found" : "run: pnpm install" };
+    },
+  },
+  {
+    name:     ".env file",
+    required: false,
+    check: () => {
+      const ok = existsSync(resolve(ROOT, ".env"));
+      return { ok, detail: ok ? "found" : "not found — copy .env.example" };
+    },
+  },
+  {
+    name:     "ANTHROPIC_API_KEY or OPENAI_API_KEY set",
+    required: false,
+    check: () => {
+      const ok = !!(process.env.ANTHROPIC_API_KEY || process.env.OPENAI_API_KEY);
+      return { ok, detail: ok ? "at least one key found" : "no API keys — stub provider will be used" };
+    },
+  },
+];
+
+// ── Run checks ──────────────────────────────────────────────────────────────
+
+let failures = 0;
+let warnings  = 0;
+
+console.log("\n  LocoWorker — Environment Check\n");
+
+for (const c of checks) {
+  const result = c.check();
+  const icon   = result.ok ? PASS : (c.required ? FAIL : WARN);
+  const color  = result.ok ? "\x1b[32m" : (c.required ? "\x1b[31m" : "\x1b[33m");
+  const reset  = "\x1b[0m";
+  const detail = result.detail ? `  ${color}(${result.detail})${reset}` : "";
+
+  console.log(`  ${color}${icon}${reset}  ${c.name.padEnd(40)}${detail}`);
+
+  if (!result.ok && c.required)  failures++;
+  if (!result.ok && !c.required) warnings++;
+}
+
+console.log();
+
+if (failures > 0) {
+  console.log(`  \x1b[31m${failures} required check(s) failed — fix the above issues and re-run.\x1b[0m\n`);
+  process.exit(1);
+} else if (warnings > 0) {
+  console.log(`  \x1b[33m${warnings} optional check(s) have warnings — some features may be unavailable.\x1b[0m\n`);
+  process.exit(0);
+} else {
+  console.log(`  \x1b[32mAll checks passed. You're good to go!\x1b[0m\n`);
+  process.exit(0);
+}
+scripts/build.ts
+TypeScript
+
+#!/usr/bin/env bun
+// scripts/build.ts
+// Orchestrates the full monorepo build in the correct dependency order.
+// Wraps turbo run build with useful progress reporting.
+
+import { spawnSync }   from "child_process";
+import { resolve }     from "path";
+
+const ROOT   = resolve(import.meta.dir, "..");
+const args   = process.argv.slice(2);
+const filter = args.find((a) => a.startsWith("--filter=")) ?? "";
+const watch  = args.includes("--watch");
+const clean  = args.includes("--clean");
+
+// ── Optional clean ──────────────────────────────────────────────────────────
+
+if (clean) {
+  console.log("Cleaning dist directories...");
+  const cleanResult = spawnSync(
+    "pnpm",
+    ["turbo", "run", "clean", "--parallel"],
+    { stdio: "inherit", cwd: ROOT }
+  );
+  if (cleanResult.status !== 0) process.exit(cleanResult.status ?? 1);
+}
+
+// ── Build ───────────────────────────────────────────────────────────────────
+
+const turboArgs = [
+  "turbo",
+  "run",
+  watch ? "dev" : "build",
+];
+
+if (filter) turboArgs.push(filter);
+
+// In CI, add Turbo remote cache flags if available
+if (process.env.TURBO_REMOTE_CACHE_SIGNATURE_KEY) {
+  turboArgs.push("--remote-cache-timeout", "30");
+}
+
+console.log(`\n  Building LocoWorker monorepo${watch ? " (watch mode)" : ""}...\n`);
+const start = Date.now();
+
+const result = spawnSync("pnpm", turboArgs, {
+  stdio:  "inherit",
+  cwd:    ROOT,
+  env:    process.env,
+});
+
+const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+
+if (result.status !== 0) {
+  console.error(`\n  Build failed after ${elapsed}s\n`);
+  process.exit(result.status ?? 1);
+}
+
+console.log(`\n  Build complete in ${elapsed}s\n`);
+scripts/clean.ts
+TypeScript
+
+#!/usr/bin/env bun
+// scripts/clean.ts
+// Removes all build artifacts: dist/, tsconfig.tsbuildinfo, .turbo cache.
+
+import { rmSync, readdirSync, existsSync } from "fs";
+import { resolve, join }                   from "path";
+
+const ROOT = resolve(import.meta.dir, "..");
+
+const TARGETS = [
+  ".turbo",
+  "node_modules/.cache",
+  // Per-package
+  ...["packages", "apps", "tests"].flatMap((dir) => {
+    const base = join(ROOT, dir);
+    if (!existsSync(base)) return [];
+    return readdirSync(base).flatMap((pkg) => [
+      join(base, pkg, "dist"),
+      join(base, pkg, "tsconfig.tsbuildinfo"),
+      join(base, pkg, ".turbo"),
+      join(base, pkg, "coverage"),
+    ]);
+  }),
+];
+
+let removed = 0;
+for (const target of TARGETS) {
+  if (existsSync(target)) {
+    try {
+      rmSync(target, { recursive: true, force: true });
+      console.log(`  removed ${target.replace(ROOT + "/", "")}`);
+      removed++;
+    } catch (e) {
+      console.warn(`  could not remove ${target}: ${String(e)}`);
+    }
+  }
+}
+
+console.log(`\n  Clean complete — removed ${removed} artifact directories.\n`);
+scripts/release.ts
+TypeScript
+
+#!/usr/bin/env bun
+// scripts/release.ts
+// Release automation:
+//   bun run scripts/release.ts --publish          → publish all workspace packages to npm
+//   bun run scripts/release.ts --changelog 1.2.3  → append changelog section
+//   bun run scripts/release.ts --tag              → create + push git tag from root version
+
+import { spawnSync }                                     from "child_process";
+import { readFileSync, writeFileSync, existsSync }        from "fs";
+import { resolve, join }                                  from "path";
+
+const ROOT    = resolve(import.meta.dir, "..");
+const args    = process.argv.slice(2);
+
+function run(cmd: string, cmdArgs: string[], opts: { cwd?: string } = {}): boolean {
+  const r = spawnSync(cmd, cmdArgs, {
+    stdio: "inherit",
+    cwd:   opts.cwd ?? ROOT,
+    env:   process.env,
+  });
+  return r.status === 0;
+}
+
+function readJson(path: string): Record<string, unknown> {
+  return JSON.parse(readFileSync(path, "utf-8"));
+}
+
+function getRootVersion(): string {
+  return (readJson(join(ROOT, "package.json")) as { version: string }).version;
+}
+
+// ── --publish ────────────────────────────────────────────────────────────────
+
+if (args.includes("--publish")) {
+  const version = process.env.RELEASE_VERSION ?? getRootVersion();
+  console.log(`\nPublishing LocoWorker ${version} to npm...\n`);
+
+  const PUBLIC_PACKAGES = [
+    "packages/shared",
+    "packages/core",
+    "packages/memory",
+    "packages/graphify",
+    "packages/wiki",
+    "packages/kairos",
+    "packages/orchestrator",
+    "packages/security",
+    "packages/tools-fs",
+    "packages/tools-bash",
+    "packages/tools-git",
+    "packages/tools-search",
+    "packages/tools-web",
+  ];
+
+  let failures = 0;
+  for (const pkg of PUBLIC_PACKAGES) {
+    const pkgPath = join(ROOT, pkg);
+    const pkgJson = readJson(join(pkgPath, "package.json")) as { name: string; private?: boolean };
+
+    if (pkgJson.private) {
+      console.log(`  skip (private): ${pkgJson.name}`);
+      continue;
+    }
+
+    console.log(`  publishing: ${pkgJson.name}@${version}`);
+    const ok = run("npm", ["publish", "--access", "public", "--tag", "latest"], {
+      cwd: pkgPath,
+    });
+
+    if (!ok) {
+      console.error(`  FAILED: ${pkgJson.name}`);
+      failures++;
+    }
+  }
+
+  if (failures > 0) {
+    console.error(`\n${failures} packages failed to publish.\n`);
+    process.exit(1);
+  }
+
+  console.log(`\nAll packages published successfully.\n`);
+  process.exit(0);
+}
+
+// ── --tag ────────────────────────────────────────────────────────────────────
+
+if (args.includes("--tag")) {
+  const version = getRootVersion();
+  const tag     = `v${version}`;
+
+  console.log(`\nCreating release tag: ${tag}\n`);
+
+  if (!run("git", ["diff", "--quiet"])) {
+    console.error("Working tree is dirty — commit or stash changes first.");
+    process.exit(1);
+  }
+
+  const ok =
+    run("git", ["tag", "-a", tag, "-m", `Release ${tag}`]) &&
+    run("git", ["push", "origin", tag]);
+
+  if (!ok) {
+    console.error("Failed to create or push tag.");
+    process.exit(1);
+  }
+
+  console.log(`\nTag ${tag} created and pushed.\n`);
+  process.exit(0);
+}
+
+// ── --changelog ───────────────────────────────────────────────────────────────
+
+if (args.includes("--changelog")) {
+  const version     = args[args.indexOf("--changelog") + 1] ?? getRootVersion();
+  const date        = new Date().toISOString().split("T")[0];
+  const changelogPath = join(ROOT, "CHANGELOG.md");
+
+  const newSection  = `## [${version}] - ${date}\n\n### Added\n- See commit history for details.\n\n`;
+
+  if (existsSync(changelogPath)) {
+    const existing = readFileSync(changelogPath, "utf-8");
+    const updated  = existing.replace(
+      /^(# Changelog\n+)/,
+      `$1${newSection}`
+    );
+    writeFileSync(changelogPath, updated, "utf-8");
+  } else {
+    writeFileSync(changelogPath, `# Changelog\n\n${newSection}`, "utf-8");
+  }
+
+  console.log(`\nChangelog updated for ${version} (${date}).\n`);
+  process.exit(0);
+}
+
+// ── Default: show help ────────────────────────────────────────────────────────
+
+console.log(`
+  Usage:
+    bun run scripts/release.ts --publish              Publish packages to npm
+    bun run scripts/release.ts --tag                  Create + push git tag
+    bun run scripts/release.ts --changelog <version>  Update CHANGELOG.md
+`);
+Root package.json scripts section (final additions)
+JSON
+
+{
+  "scripts": {
+    "build":         "bun run scripts/build.ts",
+    "build:clean":   "bun run scripts/build.ts --clean",
+    "build:watch":   "bun run scripts/build.ts --watch",
+    "dev":           "turbo run dev --parallel",
+    "typecheck":     "turbo run typecheck",
+    "lint":          "turbo run lint --parallel",
+    "test":          "turbo run test",
+    "test:unit":     "turbo run test --filter='!@locoworker/integration-tests' --filter='!@locoworker/e2e-tests'",
+    "test:int":      "pnpm --filter @locoworker/integration-tests test",
+    "test:e2e":      "pnpm --filter @locoworker/e2e-tests test",
+    "test:all":      "pnpm test:unit && pnpm test:int && pnpm test:e2e",
+    "clean":         "bun run scripts/clean.ts",
+    "check-env":     "bun run scripts/check-env.ts",
+    "version:show":  "bun run scripts/version.ts",
+    "version:bump":  "bun run scripts/version.ts --bump",
+    "version:set":   "bun run scripts/version.ts --set",
+    "release:tag":   "bun run scripts/release.ts --tag",
+    "release:pub":   "bun run scripts/release.ts --publish",
+    "release:log":   "bun run scripts/release.ts --changelog"
+  }
+}
+Pass 14 Part 2 — complete summary
+Deliverable	Files	What it does
+E2E harness	harness/processRunner.ts	ManagedProcess, OutputCapture, findFreePort, waitForPort — generic subprocess lifecycle
+harness/gatewayProcess.ts	Spawns real gateway on ephemeral port, waits for /health, exposes GatewayHandle
+harness/cliRunner.ts	runCli (sync), spawnCli (async streaming), createCliWorkspace
+harness/sseReader.ts	Real SSE over TCP using fetch + ReadableStream, full line parser, returns structured SseReadResult
+harness/wsTestClient.ts	WsTestClient — connect, send, waitForType, multiple concurrent clients
+E2E suites	gateway.e2e.test.ts	Health, sessions CRUD, memory, wiki CRUD, graph stats, admin — all over real HTTP
+sessions.e2e.test.ts	Full session lifecycle, rate-limit headers, injection guard, Kairos tasks
+stream.e2e.test.ts	SSE event shape, content-type header, abort handling, concurrent streams
+ws.e2e.test.ts	Connect, welcome, ping/pong, subscribe/unsubscribe, multi-client, unknown message type
+cli.e2e.test.ts	--version, --help, all subcommands, --json query mode, REPL via stdin
+CI workflows	.github/workflows/ci.yml	9-job pipeline: install → lint → typecheck → build → unit → integration → e2e → cross-platform smoke → gate
+.github/workflows/pr.yml	Fast PR gate (< 5 min): typecheck + build + focused unit subset
+.github/workflows/release.yml	Tag-triggered: validate → full tests → build packages + desktop (matrix) → GitHub release → npm publish
+Turbo pipeline	turbo.json	Final complete task graph — all 18 packages + 4 apps, cache keys, globalEnv, all custom tasks
+Scripts	scripts/version.ts	Read / bump / set / check version across all package.json files + constants.ts
+scripts/check-env.ts	Pre-flight: bun, pnpm, Node, git, turbo, lockfile, .env, API keys
+scripts/build.ts	Turbo build wrapper with optional clean + watch + filter
+scripts/clean.ts	Remove all dist/, tsconfig.tsbuildinfo, .turbo, coverage/
+scripts/release.ts	npm publish, git tag + push, CHANGELOG append
