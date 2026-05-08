@@ -102,3 +102,41 @@ pnpm turbo run build
 
 # 4. Verify
 pnpm turbo run typecheck
+
+
+
+Critical file path consistency rules
+Across all passes, use these canonical paths:
+
+Component	Entry point
+Core	packages/core/src/index.ts
+Gateway	apps/gateway/src/main.ts → builds to dist/main.js (CJS)
+CLI	apps/cli/src/index.ts
+Dashboard	apps/dashboard/src/main.tsx
+Desktop main	apps/desktop/src/main/index.ts
+Desktop preload	apps/desktop/src/preload/index.ts
+Keychain	packages/keychain/src/index.ts
+File override map (for conflict resolution)
+If you see the same file path in multiple passes, use this table:
+
+File path	Canonical pass	Reason
+packages/core/src/queryLoop.ts	Pass 19	Async generator rewrite
+packages/core/src/ToolExecutor.ts	Pass 19	Parallel-safe executor
+packages/core/src/PermissionGate.ts	Pass 20	Adds promptId to events
+packages/kairos/src/engine/*	Pass 22	Real engine (Pass 6 was stub)
+packages/orchestrator/src/engine/*	Pass 22	Real engine (Pass 7 was stub)
+apps/gateway/src/runtime/GatewayRuntime.ts	Pass 20	SSE + permission broker
+apps/gateway/src/routes/*	Pass 20	Real routes (Pass 8 was partial)
+apps/cli/src/commands/*	Pass 21	Real CLI (Pass 14 was stubs)
+apps/dashboard/src/store/*	Pass 23	Real store (Pass 15 was scaffold)
+apps/desktop/src/main/*	Pass 24	Embedded gateway arch
+apps/desktop/src/preload/index.ts	Pass 24	contextBridge with gateway + keychain
+Validation checklist
+After building, verify these critical integration points:
+
+ curl http://127.0.0.1:8787/v1/health → 200 OK
+ node apps/cli/dist/index.js --version → prints version
+ grep 'src="./assets' apps/dashboard/dist/index.html → uses relative paths (not /assets)
+ ls apps/desktop/build/entitlements.mac.plist → exists
+ grep 'module.exports' apps/gateway/dist/main.js → gateway is CJS
+ grep 'promptId' packages/core/dist/PermissionGate.js → permission events have promptId
