@@ -20,3 +20,9 @@ The original design spec (`Completeproject.md`) described the desktop app as "Ta
 - **Memory footprint**: Electron uses more RAM. We accept this for the target audience (developers with modern machines).
 
 ## Canonical stack (Pass 24 final)
+
+Electron 30+ ├─ Main process (Node.js) │ ├─ Spawns Gateway child process (Node.js) │ ├─ Manages OS keychain via keytar │ └─ Exposes minimal IPC surface via ipcMain ├─ Preload script │ └─ Exposes window.locoworker bridge via contextBridge └─ Renderer process └─ Loads Dashboard (Pass 23) at locoworker-app:// custom protocol
+
+
+## Migration note
+If you see references to Tauri in `Completeproject.md`, treat them as superseded by this decision.
